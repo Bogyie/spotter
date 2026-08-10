@@ -1,2 +1,143 @@
-# spotter
-AI Agent Spotter ( Pair programming )
+# Spotter
+
+> **A runtime spotter for coding agents.**
+>
+> Your coding agent drives. Spotter watches the trajectory, challenges bad assumptions, and steps in before wasted work compounds.
+
+Spotter is an experimental runtime supervision layer for coding agents, starting with Codex.
+
+Modern coding agents are good at moving forward. They are less reliable at noticing when they are confidently moving in the wrong direction: drifting from the request, locking onto a weak hypothesis, repeating low-information actions, expanding scope, skipping validation, or carrying a stale assumption deep into an implementation.
+
+Spotter pairs the main coding agent with an **independent reviewer model** that observes the work as it unfolds and intervenes only when intervention is likely to help.
+
+```text
+                 User Goal
+                    │
+                    ▼
+              Main Agent
+            drives the work
+                    │
+       action / tool / result / diff
+                    │
+                    ▼
+                 Spotter
+          observes the trajectory
+                    │
+       ┌────────────┼────────────┐
+       ▼            ▼            ▼
+    CONTINUE      VERIFY      NUDGE
+                                │
+                     BLOCK / INTERRUPT / RESTART
+```
+
+## The idea
+
+A good gym spotter does not lift every rep for you. They watch, stay out of the way, and intervene when the lift is about to fail.
+
+Spotter applies the same principle to coding agents:
+
+- **Always observe. Rarely interrupt.**
+- Review the **execution path**, not just the final diff.
+- Prefer **evidence and executable verification** over agent-to-agent debate.
+- Use deterministic checks for deterministic constraints; spend LLM reasoning only on ambiguous cases.
+- Let the main agent and Spotter use **different models and isolated judgment contexts**.
+- Escalate intervention gradually: `CONTINUE → VERIFY → NUDGE → BLOCK → INTERRUPT → RESTART`.
+
+The goal is not to add more reasoning. The goal is to keep reasoning and execution **grounded, economical, and recoverable**.
+
+## Why trajectory-level supervision?
+
+Traditional code review starts after code exists. Spotter starts earlier.
+
+```text
+Traditional review
+intent → reasoning → exploration → edit → test → diff → REVIEW
+
+Spotter
+intent → reasoning → exploration → edit → test → diff
+           ↑          ↑          ↑      ↑
+             runtime supervision
+```
+
+Many agent failures are processes, not isolated bad outputs. A weak assumption can trigger unnecessary exploration, which triggers the wrong edit, which creates misleading test failures, which causes further compensating changes. By the time a post-hoc reviewer sees the diff, most of the cost has already been paid.
+
+Spotter is about intervening near the **first meaningful deviation**, before the mistake becomes the trajectory.
+
+## What Spotter watches for
+
+Spotter focuses on execution failures such as:
+
+- specification or scope drift
+- unsupported or stale assumptions
+- premature implementation
+- tunnel vision around one hypothesis
+- repetitive exploration with little new evidence
+- tool-error loops
+- unnecessary refactors or dependency creep
+- missed constraints
+- edits without adequate validation
+- continuing from a premise that later evidence invalidated
+
+It is intentionally not just another static code reviewer.
+
+## Intervention ladder
+
+| Decision | Meaning |
+| --- | --- |
+| `CONTINUE` | Work looks healthy. Stay silent. |
+| `VERIFY` | A consequential assumption needs evidence before more work depends on it. |
+| `NUDGE` | The trajectory is starting to drift or waste effort. Add a small course correction. |
+| `BLOCK` | A pending action clearly violates a known constraint or policy. Stop it before execution. |
+| `INTERRUPT` | Continuing the current turn is likely to compound a bad trajectory. |
+| `RESTART` | The current reasoning context itself is no longer trustworthy; restart from verified state. |
+
+A central design question is not only **“Is the agent wrong?”** but **“Is intervening now better than letting it continue?”**
+
+## Codex is a good first target
+
+Current Codex runtime primitives make this design practical:
+
+- lifecycle hooks including `PreToolUse`, `PostToolUse`, `SessionStart`, and others
+- `PreToolUse` can inspect, block, or rewrite many local tool calls before execution
+- App Server streams plan, reasoning-summary, tool, message, and diff-related events
+- `turn/steer` can inject a course correction into an active turn
+- `turn/interrupt` can stop an in-flight turn
+
+See [Architecture](docs/architecture.md) for the proposed integration.
+
+## Main + Spotter
+
+Spotter is not meant to become a second user giving orders.
+
+> **The user defines the goal. Spotter reviews the path.**
+
+The main agent remains the driver. Spotter acts as an independent falsifier and runtime controller. When they disagree, the preferred resolution is a cheap empirical probe — a test, compiler result, repository search, log, or other external evidence — rather than a long debate between models.
+
+## Trajectory Engineering
+
+Spotter is also an experiment in a broader idea: **Trajectory Engineering**.
+
+Prompt engineering shapes an instruction. Context engineering shapes what the model can see. Harness engineering shapes the environment and tools around the agent.
+
+Trajectory engineering asks a different question:
+
+> **While the agent is already working, how do we observe, verify, steer, stop, and recover the path it is taking?**
+
+Spotter is intended as a reference implementation for exploring that layer.
+
+## Documentation
+
+- [Concept](docs/concept.md) — problem definition, principles, and scope
+- [Architecture](docs/architecture.md) — runtime design and Codex integration
+- [Research](docs/research.md) — related work and ideas Spotter borrows
+- [Roadmap](docs/roadmap.md) — staged implementation and evaluation plan
+
+## Status
+
+**Research / design stage.** The repository currently documents the concept and planned architecture before implementation begins.
+
+The first milestone is deliberately small: observe a Codex trajectory with a separate reviewer model, identify high-confidence misbehavior, and measure whether intervention helps more than it harms.
+
+## License
+
+MIT
