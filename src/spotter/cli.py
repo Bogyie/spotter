@@ -2,14 +2,19 @@
 
 import argparse
 import json
+import subprocess
 import sys
 import tomllib
 from collections.abc import Sequence
+from contextlib import suppress
+from dataclasses import replace
+from fcntl import LOCK_EX, LOCK_NB, flock
 from pathlib import Path
 
 from spotter.codex import CodexAdapter
 from spotter.config import ConfigurationError, MainAgentConfig, ReviewerConfig, SpotterConfig
 from spotter.core import SpotterRuntime
+from spotter.experiment import results_path, run_experiment, summarize
 from spotter.gates import Gate
 from spotter.hook import journal_path, run_hook
 from spotter.replay import ReplayError, fork, plan_to_json
@@ -30,13 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["observe", "hook", "analyze", "fork", "prune", "review"],
+        choices=["observe", "hook", "analyze", "fork", "prune", "review", "experiment"],
         default="observe",
         help=(
             "observe: validate config and start; hook: Codex hook bridge (JSON on stdin); "
             "analyze: summarize journaled sessions; fork: branch a session at a step; "
             "prune: drop unreferenced refs/spotter snapshots (dry-run without --apply); "
-            "review: run the shadow reviewer on a session (records only, injects nothing)"
+            "review: run the shadow reviewer on a session (records only, injects nothing); "
+            "experiment: counterfactual fork pairs — nudge vs control (needs --run to execute)"
         ),
     )
     parser.add_argument("--config", type=Path, help="path to Spotter TOML config")
@@ -51,6 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--window", type=int, default=40, help="review: trajectory tail size fed to the reviewer"
+    )
+    parser.add_argument("--pairs", type=int, default=1, help="experiment: counterfactual pairs")
+    parser.add_argument("--model", help="review/experiment: pin the Codex model")
+    parser.add_argument(
+        "--check", help="experiment: success command run in each fork worktree (exit 0 = pass)"
+    )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="experiment: actually execute the 2*pairs agent runs (costs real tokens)",
+    )
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="experiment: keep forked worktrees (rollouts are always retained)",
     )
     return parser
 
@@ -70,16 +91,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _load_config(parser, args.config)
 
     if args.command == "hook":
-        return _hook_main(config)
+        return _hook_main(config, args.config)
     if args.command == "analyze":
         return _analyze_main(args.session)
     if args.command == "prune":
         return _prune_main(args.repo or Path.cwd(), apply=args.apply)
+    if args.command == "experiment":
+        if not args.session or args.step is None or not args.guidance:
+            parser.error("experiment requires --session, --step and --guidance")
+        if args.pairs < 1:
+            parser.error("--pairs must be >= 1")
+        try:
+            results = run_experiment(
+                args.session,
+                args.step,
+                args.guidance,
+                pairs=args.pairs,
+                check=args.check,
+                run=args.run,
+                model=args.model,
+                keep_artifacts=args.keep_artifacts,
+            )
+        except (ReplayError, SnapshotError, OSError, subprocess.SubprocessError) as error:
+            print(f"experiment failed: {error}", file=sys.stderr)
+            return 1
+        print(summarize(results))
+        print(f"rows appended to {results_path(args.session, args.step)}")
+        return 0
     if args.command == "review":
         if not args.session:
             parser.error("review requires --session")
         if config is None:
             config = SpotterConfig(MainAgentConfig("codex"), ReviewerConfig())
+        if args.model:
+            config = replace(config, reviewer=replace(config.reviewer, model=args.model))
         return _review_main(args.session, config, window=args.window)
     if args.command == "fork":
         if not args.session or args.step is None:
@@ -134,10 +179,19 @@ def _analyze_main(session: str | None) -> int:
         proposals = [r for r in records if r.event.kind == "tool_proposal"]
         snapshots = sum(1 for r in records if r.snapshot)
         flagged = [r for r in records if r.event.kind in ("gate_shadow_block", "gate_fail_open")]
+        verdicts = [r for r in records if r.event.kind == "reviewer_decision"]
         print(
             f"{journal.stem}: steps={len(records)} proposals={len(proposals)} "
-            f"snapshots={snapshots} flagged={len(flagged)}"
+            f"snapshots={snapshots} flagged={len(flagged)} reviews={len(verdicts)}"
         )
+        for record in verdicts:
+            payload = record.event.payload
+            print(
+                f"  step {record.step:4d} reviewer         "
+                f"{payload.get('decision')}/{payload.get('failure_class')} "
+                f"conf={payload.get('confidence')}: "
+                f"{str(payload.get('reason'))[:100]}"
+            )
         for record in flagged:
             trigger = _trigger_for(records, record)
             summary = str(trigger.get("command") or trigger.get("patch") or trigger)
@@ -173,6 +227,16 @@ def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
     """Shadow reviewer: judge the trajectory tail, journal the verdict, inject
     nothing. Injection rights are earned later via labeling + fork pairs."""
     journal_file = journal_path({"session_id": session})
+    # In-flight guard: a slow model call must not stack duplicate paid reviews
+    # of the same session when the next cadence tick arrives.
+    lock_file = journal_file.with_suffix(".review.lock")
+    lock = lock_file.open("w")
+    try:
+        flock(lock, LOCK_EX | LOCK_NB)
+    except OSError:
+        print(f"review already in flight for {session}; skipping", file=sys.stderr)
+        lock.close()
+        return 0
     try:
         records = StepJournal.load(journal_file)
     except (OSError, SnapshotError) as error:
@@ -185,6 +249,12 @@ def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
         decision = review(records, config.reviewer.model, window=window)
     except Exception as error:  # noqa: BLE001 — reviewer failure must stay observable, not fatal
         print(f"review failed: {error}", file=sys.stderr)
+        # Failure evidence belongs in the journal too — "no verdict" must be
+        # distinguishable from "reviewer silently died".
+        with suppress(SnapshotError):
+            StepJournal(journal_file).record(
+                TraceEvent("reviewer_error", {"error": str(error)[:300]})
+            )
         return 1
     StepJournal(journal_file).record(
         TraceEvent(
@@ -230,7 +300,7 @@ def _prune_main(repo: Path, *, apply: bool) -> int:
     return 0
 
 
-def _hook_main(config: SpotterConfig | None) -> int:
+def _hook_main(config: SpotterConfig | None, config_path: Path | None = None) -> int:
     """Read one hook payload from stdin, print a decision if any.
 
     Always exits 0: any failure here fails open. Breaking the Codex session
@@ -242,7 +312,7 @@ def _hook_main(config: SpotterConfig | None) -> int:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
-        output = run_hook(payload, config)
+        output = run_hook(payload, config, config_path)
     except Exception as error:  # noqa: BLE001 — deliberate fail-open boundary
         print(f"spotter hook error (failing open): {error}", file=sys.stderr)
         return 0
