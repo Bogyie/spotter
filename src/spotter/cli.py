@@ -13,7 +13,14 @@ from spotter.core import SpotterRuntime
 from spotter.gates import Gate
 from spotter.hook import journal_path, run_hook
 from spotter.replay import ReplayError, fork, plan_to_json
-from spotter.snapshot import SnapshotError, StepJournal
+from spotter.snapshot import (
+    SnapshotError,
+    StepJournal,
+    StepRecord,
+    global_lock,
+    prune_snapshots,
+    referenced_snapshots,
+)
 from spotter.trace import TraceEvent
 
 
@@ -22,18 +29,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["observe", "hook", "analyze", "fork"],
+        choices=["observe", "hook", "analyze", "fork", "prune"],
         default="observe",
         help=(
             "observe: validate config and start; hook: Codex hook bridge (JSON on stdin); "
-            "analyze: summarize journaled sessions; fork: branch a session at a step"
+            "analyze: summarize journaled sessions; fork: branch a session at a step; "
+            "prune: drop unreferenced refs/spotter snapshots (dry-run without --apply)"
         ),
     )
     parser.add_argument("--config", type=Path, help="path to Spotter TOML config")
     parser.add_argument("--session", help="session id (fork; analyze filters to it)")
     parser.add_argument("--step", type=int, help="journal step to branch at (fork)")
-    parser.add_argument("--repo", type=Path, help="repo override when the journal lacks cwd (fork)")
+    parser.add_argument(
+        "--repo", type=Path, help="repo path (prune; fork override when the journal lacks cwd)"
+    )
     parser.add_argument("--guidance", help="course-correction text for the forked run (fork)")
+    parser.add_argument(
+        "--apply", action="store_true", help="prune: actually delete (default is dry-run)"
+    )
     return parser
 
 
@@ -55,6 +68,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _hook_main(config)
     if args.command == "analyze":
         return _analyze_main(args.session)
+    if args.command == "prune":
+        return _prune_main(args.repo or Path.cwd(), apply=args.apply)
     if args.command == "fork":
         if not args.session or args.step is None:
             parser.error("fork requires --session and --step")
@@ -113,13 +128,56 @@ def _analyze_main(session: str | None) -> int:
             f"snapshots={snapshots} flagged={len(flagged)}"
         )
         for record in flagged:
-            trigger = records[record.step - 1].event.payload if record.step > 0 else {}
+            trigger = _trigger_for(records, record)
             summary = str(trigger.get("command") or trigger.get("patch") or trigger)
             summary = " ".join(summary.split())[:120]
             print(
                 f"  step {record.step:4d} {record.event.kind:17s} "
                 f"{record.event.payload.get('rule')}: {summary}"
             )
+    return 0
+
+
+def _trigger_for(records: list[StepRecord], flagged: StepRecord) -> dict[str, object]:
+    """Resolve the proposal that triggered a gate event.
+
+    Match by the tool_use_id the gate event carries; journal adjacency is not
+    trustworthy under concurrent hook processes. Falls back to the previous
+    record only for journals written before the id was recorded.
+    """
+    wanted = flagged.event.payload.get("tool_use_id")
+    if wanted:
+        for record in reversed(records[: flagged.step]):
+            if (
+                record.event.kind == "tool_proposal"
+                and record.event.payload.get("tool_use_id") == wanted
+            ):
+                return record.event.payload
+    if flagged.step > 0:
+        return records[flagged.step - 1].event.payload
+    return {}
+
+
+def _prune_main(repo: Path, *, apply: bool) -> int:
+    """Drop refs/spotter/steps/* that no journal references (issue #7).
+
+    Dry-run by default: deleting a snapshot is the one spotter operation that
+    can destroy fork-ability, so the human confirms with --apply. The global
+    lock serializes against a hook that has pinned a ref but not yet
+    journaled it.
+    """
+    sessions_dir = journal_path({"session_id": "probe"}).parent
+    try:
+        with global_lock():
+            referenced = referenced_snapshots(sessions_dir, repo)
+            pruned = prune_snapshots(repo, referenced, apply=apply)
+    except SnapshotError as error:
+        print(f"prune aborted: {error}", file=sys.stderr)
+        return 1
+    verb = "deleted" if apply else "would delete (pass --apply)"
+    print(f"{len(referenced)} snapshots referenced by journals; {verb} {len(pruned)} refs")
+    for sha in pruned:
+        print(f"  {sha}")
     return 0
 
 

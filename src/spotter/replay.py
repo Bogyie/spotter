@@ -11,8 +11,11 @@ Mechanism (approximate replay, the plan's fallback path):
    the pair is a same-prefix counterfactual (plan Q3).
 
 Honest limits, stated rather than papered over:
-- Whether `codex exec resume` accepts a truncated rollout is UNVERIFIED until
-  the first real run; that experiment IS the P0 exit criterion.
+- Resume compatibility VERIFIED 2026-08-11: `codex exec resume` accepted a
+  truncated rollout (fork of a real 104-step session at step 98). The agent
+  located its context at the branch point and reported the cut call as "my
+  last action was interrupted" — the exact branch semantics wanted. The cut
+  leaves one dangling call; Codex logs a warning and proceeds.
 - Sessions journaled before snapshots/tool_use_id existed cannot be forked;
   the errors below say exactly which ingredient is missing.
 - This does not execute anything itself: launching costs money and runs an
@@ -20,6 +23,7 @@ Honest limits, stated rather than papered over:
 """
 
 import json
+import shlex
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,7 +47,11 @@ class ForkPlan:
 
 def find_rollout(session_id: str, codex_home: Path | None = None) -> Path:
     home = codex_home or Path.home() / ".codex"
-    matches = sorted((home / "sessions").rglob(f"rollout-*{session_id}.jsonl"))
+    matches = sorted(
+        path
+        for path in (home / "sessions").rglob("rollout-*.jsonl")
+        if path.stem.endswith(session_id)
+    )
     if not matches:
         raise ReplayError(f"no rollout found for session {session_id} under {home}/sessions")
     return matches[-1]
@@ -58,23 +66,26 @@ def fork_rollout(rollout: Path, call_id: str, new_id: str) -> Path:
     lines = rollout.read_text(encoding="utf-8").splitlines()
     if not lines:
         raise ReplayError(f"rollout is empty: {rollout}")
-    meta = json.loads(lines[0])
-    old_id = str(meta.get("payload", {}).get("session_id") or "")
+    meta = _rollout_record(lines[0], 1)
+    payload = meta.get("payload")
+    if not isinstance(payload, dict):
+        raise ReplayError("rollout has no session_meta payload on line 1")
+    old_id = str(payload.get("session_id") or "")
     if not old_id:
         raise ReplayError("rollout has no session_meta session_id on line 1")
-    cut = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if f'"call_id":"{call_id}"' in line or f'"call_id": "{call_id}"' in line
-        ),
-        None,
-    )
+    cut = None
+    for index, line in enumerate(lines[1:], 1):
+        if call_id in _record_ids(_rollout_record(line, index + 1)):
+            cut = index
+            break
     if cut is None:
         raise ReplayError(f"call_id {call_id} not found in rollout {rollout.name}")
     if cut == 0:
         raise ReplayError("branch point is the first record; nothing to resume from")
-    forked = [line.replace(old_id, new_id) for line in lines[:cut]]
+    payload["session_id"] = new_id
+    if payload.get("id") == old_id:
+        payload["id"] = new_id
+    forked = [json.dumps(meta), *lines[1:cut]]
     dest = rollout.with_name(rollout.name.replace(old_id, new_id))
     if dest.exists():
         raise ReplayError(f"forked rollout already exists: {dest}")
@@ -114,11 +125,17 @@ def fork(
 
     new_id = str(uuid.uuid4())
     worktree = dest or journal_file.parent.parent / "forks" / new_id
-    restore_snapshot(repo_path, snapshot, worktree)
     forked_rollout = fork_rollout(find_rollout(session_id, codex_home), call_id, new_id)
+    try:
+        restore_snapshot(repo_path, snapshot, worktree)
+    except Exception:
+        forked_rollout.unlink(missing_ok=True)
+        raise
 
-    prompt = f" {json.dumps(guidance)}" if guidance else ""
-    command = f"codex exec resume {new_id} -C {worktree} --json{prompt}"
+    argv = ["codex", "exec", "-C", str(worktree), "resume", "--json", new_id]
+    if guidance:
+        argv.append(guidance)
+    command = shlex.join(argv)
     return ForkPlan(
         session_id=new_id,
         branch_step=step,
@@ -130,6 +147,39 @@ def fork(
 
 def plan_to_json(plan: ForkPlan) -> str:
     return json.dumps(asdict(plan), indent=2)
+
+
+def _rollout_record(line: str, number: int) -> dict[str, object]:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise ReplayError(f"invalid rollout JSON on line {number}: {error.msg}") from error
+    if not isinstance(record, dict):
+        raise ReplayError(f"rollout line {number} is not a JSON object")
+    return record
+
+
+def _record_ids(record: dict[str, object]) -> set[object]:
+    """Ids under which a tool call appears in a rollout record.
+
+    The hook's tool_use_id surfaces as event_msg payload.item.id (harness id),
+    while response_item records carry the model-level payload.call_id — the
+    branch cut happens at whichever mentions the id first.
+
+    ponytail: cutting at the first *mention* can leave the proposal of the
+    branch call in history when only a completion event carries the id.
+    Good enough for the resume-compat experiment; tighten to turn boundaries
+    if resumed agents visibly double-apply the branch step.
+    """
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return set()
+    ids: set[object] = {payload.get("call_id")}
+    item = payload.get("item")
+    if isinstance(item, dict):
+        ids.add(item.get("id"))
+    ids.discard(None)
+    return ids
 
 
 def _nearest_snapshot(records: list[StepRecord], step: int) -> str | None:
