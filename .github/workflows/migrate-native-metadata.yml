@@ -27,24 +27,44 @@ jobs:
             gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: ${API_VERSION}" "$@"
           }
 
-          # GitHub's issue-field value endpoints only require repository Issues:write,
-          # but discovering organization field IDs may require organization Issue Fields:read.
-          # Try discovery here; if the Actions token cannot read the catalog, all other
-          # native metadata still migrates and the job prints an explicit warning.
+          priority_id=""
+          effort_id=""
+          area_id=""
+
+          # First try the organization REST catalog. Repository-scoped Actions tokens
+          # may not have organization Issue Fields:read even when they can set values.
           fields_json=""
           if fields_json=$(api "/orgs/${OWNER}/issue-fields" 2>/tmp/issue-fields.err); then
             priority_id=$(jq -r '.[] | select(.name == "Priority") | .id' <<<"${fields_json}" | head -n1)
             effort_id=$(jq -r '.[] | select(.name == "Effort") | .id' <<<"${fields_json}" | head -n1)
             area_id=$(jq -r '.[] | select(.name == "Area") | .id' <<<"${fields_json}" | head -n1)
-            if [[ -z "${priority_id}" || -z "${effort_id}" || -z "${area_id}" ]]; then
-              echo "::warning::Could not resolve Priority, Effort, and Area field IDs; structured field values will be skipped."
-              priority_id=""; effort_id=""; area_id=""
-            else
-              echo "Resolved issue fields: Priority=${priority_id}, Effort=${effort_id}, Area=${area_id}"
-            fi
           else
-            echo "::warning::The repository Actions token cannot list organization issue fields; Priority/Effort/Area values will be skipped in this pass."
-            cat /tmp/issue-fields.err || true
+            echo "Organization field catalog unavailable to Actions token; trying repository-inherited fields via GraphQL."
+          fi
+
+          # Repository.issueFields exposes fields inherited from the organization and
+          # can be readable with repository metadata access even when org field admin
+          # endpoints are not. fullDatabaseId is the integer required by REST writes.
+          if [[ -z "${priority_id}" || -z "${effort_id}" || -z "${area_id}" ]]; then
+            graphql_fields=""
+            if graphql_fields=$(gh api graphql \
+              -f owner="${OWNER}" \
+              -f repo="${REPO}" \
+              -f query='query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){issueFields(first:50){nodes{__typename ... on IssueFieldSingleSelect{name fullDatabaseId}}}}}' \
+              2>/tmp/graphql-fields.err); then
+              priority_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Priority") | .fullDatabaseId // empty' <<<"${graphql_fields}" | head -n1)
+              effort_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Effort") | .fullDatabaseId // empty' <<<"${graphql_fields}" | head -n1)
+              area_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Area") | .fullDatabaseId // empty' <<<"${graphql_fields}" | head -n1)
+            else
+              echo "::warning::Repository issueFields GraphQL lookup also failed."
+              cat /tmp/graphql-fields.err || true
+            fi
+          fi
+
+          if [[ -n "${priority_id}" && -n "${effort_id}" && -n "${area_id}" ]]; then
+            echo "Resolved issue fields: Priority=${priority_id}, Effort=${effort_id}, Area=${area_id}"
+          else
+            echo "::warning::Could not resolve Priority, Effort, and Area field IDs; structured field values will be skipped."
             priority_id=""; effort_id=""; area_id=""
           fi
 
@@ -111,8 +131,7 @@ jobs:
             echo "dependency: #${issue} blocked by #${blocker}"
           }
 
-          # Keep native dependencies conservative: only relationships that genuinely
-          # prevent completion of the dependent issue are encoded here.
+          # Only encode relationships that genuinely prevent completion.
           add_blocked_by 31 78
           add_blocked_by 28 78
           add_blocked_by 28 31
@@ -136,8 +155,7 @@ jobs:
           add_blocked_by 36 22
           add_blocked_by 36 26
 
-          # Labels are now exceptional contributor-facing tags only. Remove the old
-          # taxonomy from the repository itself, retaining GitHub's contributor signals.
+          # Labels are exceptional contributor-facing tags only.
           api --paginate "/repos/${OWNER}/${REPO}/labels?per_page=100" --jq '.[].name' | while IFS= read -r label; do
             case "${label}" in
               "good first issue"|"help wanted") continue ;;
