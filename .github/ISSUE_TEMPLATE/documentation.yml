@@ -1,17 +1,16 @@
 name: Documentation
-description: Report unclear, missing, inconsistent, or outdated documentation.
+description: Improve or correct repository documentation without changing product behavior.
+labels: ["type:docs"]
 body:
   - type: textarea
     id: problem
     attributes:
-      label: What is unclear or outdated?
-      description: Point to the page/section when possible and describe the confusion or mismatch.
+      label: Documentation problem
+      description: What is missing, inaccurate, stale, or hard to understand?
     validations:
       required: true
   - type: textarea
-    id: desired
+    id: done
     attributes:
-      label: Desired outcome
-      description: What should a reader understand or find more easily after this is fixed?
-    validations:
-      required: true
+      label: Done when
+      description: Optional. What should a reader be able to understand or do after the change?
