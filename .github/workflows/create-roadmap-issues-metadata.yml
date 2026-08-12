@@ -1,7 +1,9 @@
 name: Apply roadmap issue metadata
 
 on:
-  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/create-roadmap-issues-metadata.yml
 
 permissions:
   contents: read
@@ -10,5 +12,113 @@ permissions:
 jobs:
   metadata:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OWNER: spotter-agent
+      REPO: spotter
+      API_VERSION: 2026-03-10
     steps:
-      - run: echo "Issue numbers are filled after issue creation."
+      - name: Apply fields, types, and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api() {
+            gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: ${API_VERSION}" "$@"
+          }
+
+          fields=$(gh api graphql \
+            -f owner="${OWNER}" \
+            -f repo="${REPO}" \
+            -f query='query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){issueFields(first:50){nodes{__typename ... on IssueFieldSingleSelect{name fullDatabaseId}}}}}')
+          priority_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Priority") | .fullDatabaseId // empty' <<<"${fields}" | head -n1)
+          effort_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Effort") | .fullDatabaseId // empty' <<<"${fields}" | head -n1)
+          area_id=$(jq -r '.data.repository.issueFields.nodes[] | select(.name == "Area") | .fullDatabaseId // empty' <<<"${fields}" | head -n1)
+          test -n "${priority_id}" && test -n "${effort_id}" && test -n "${area_id}"
+
+          set_metadata() {
+            local number="$1" type="$2" priority="$3" effort="$4" area="$5"
+            jq -n --arg type "${type}" '{type:$type}' |
+              api --method PATCH "/repos/${OWNER}/${REPO}/issues/${number}" --input - >/dev/null
+            jq -n \
+              --argjson priority_id "${priority_id}" --arg priority "${priority}" \
+              --argjson effort_id "${effort_id}" --arg effort "${effort}" \
+              --argjson area_id "${area_id}" --arg area "${area}" \
+              '{issue_field_values:[
+                {field_id:$priority_id,value:$priority},
+                {field_id:$effort_id,value:$effort},
+                {field_id:$area_id,value:$area}
+              ]}' |
+              api --method POST "/repos/${OWNER}/${REPO}/issues/${number}/issue-field-values" --input - >/dev/null
+            echo "metadata #${number}: ${type} / ${priority} / ${effort} / ${area}"
+          }
+
+          set_metadata 79 Feature      High   XL Runtime
+          set_metadata 80 Feature      High   L  Runtime
+          set_metadata 81 Architecture High   L  Runtime
+          set_metadata 82 Feature      High   M  Runtime
+          set_metadata 83 Feature      High   L  Operations
+          set_metadata 84 Feature      Medium M  Operations
+          set_metadata 85 Feature      High   L  Observation
+          set_metadata 86 Task         Medium M  Observation
+          set_metadata 87 Feature      Medium L  Runtime
+          set_metadata 88 Task         Medium M  Operations
+          set_metadata 89 Feature      Medium L  Operations
+          set_metadata 90 Feature      Medium L  Operations
+
+          issue_id() {
+            api "/repos/${OWNER}/${REPO}/issues/$1" --jq '.id'
+          }
+
+          add_blocked_by() {
+            local issue="$1" blocker="$2"
+            if api "/repos/${OWNER}/${REPO}/issues/${issue}/dependencies/blocked_by" --jq '.[].number' | grep -qx "${blocker}"; then
+              echo "dependency already exists: #${issue} blocked by #${blocker}"
+              return
+            fi
+            local blocker_id
+            blocker_id=$(issue_id "${blocker}")
+            api --method POST "/repos/${OWNER}/${REPO}/issues/${issue}/dependencies/blocked_by" -F issue_id="${blocker_id}" >/dev/null
+            echo "dependency: #${issue} blocked by #${blocker}"
+          }
+
+          # Runtime foundation
+          add_blocked_by 79 78
+          add_blocked_by 80 78
+          add_blocked_by 81 80
+          add_blocked_by 82 79
+          add_blocked_by 83 79
+          add_blocked_by 83 80
+          add_blocked_by 83 82
+          add_blocked_by 84 79
+          add_blocked_by 84 80
+          add_blocked_by 84 82
+          add_blocked_by 84 83
+
+          # Observation and existing live-state/evaluation work
+          add_blocked_by 85 80
+          add_blocked_by 85 81
+          add_blocked_by 31 79
+          add_blocked_by 31 81
+          add_blocked_by 31 85
+          add_blocked_by 37 85
+          add_blocked_by 37 31
+          add_blocked_by 86 85
+          add_blocked_by 86 37
+          add_blocked_by 86 82
+
+          # Recovery of the runtime itself
+          add_blocked_by 87 79
+          add_blocked_by 87 80
+          add_blocked_by 87 81
+          add_blocked_by 87 31
+
+          # Harden lifecycle
+          add_blocked_by 88 79
+          add_blocked_by 89 83
+          add_blocked_by 89 88
+          add_blocked_by 89 47
+          add_blocked_by 90 79
+          add_blocked_by 90 80
+          add_blocked_by 90 88
+          add_blocked_by 90 47
