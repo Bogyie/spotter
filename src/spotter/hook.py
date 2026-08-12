@@ -10,12 +10,15 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from spotter.budget import cancel, reserve
 from spotter.config import SpotterConfig
 from spotter.core import SpotterRuntime
 from spotter.gates import Gate
+from spotter.paths import sanitize_session, secure_dir, spotter_home
 from spotter.snapshot import SnapshotError, StepJournal, global_lock, snapshot_worktree
 from spotter.trace import TraceEvent
 
@@ -86,18 +89,9 @@ def event_from_hook(payload: dict[str, Any]) -> TraceEvent:
     return TraceEvent(str(name or "unknown").lower())
 
 
-def sanitize_session(session_id: object) -> str:
-    """External input headed into a filename — never let it carry a path."""
-    return re.sub(r"[^A-Za-z0-9_-]", "_", str(session_id or "unknown"))
-
-
-def spotter_home() -> Path:
-    return Path(os.environ.get("SPOTTER_HOME", Path.home() / ".spotter"))
-
-
 def journal_path(payload: dict[str, Any]) -> Path:
-    base = spotter_home() / "sessions"
-    base.mkdir(parents=True, exist_ok=True)
+    secure_dir(spotter_home())
+    base = secure_dir(spotter_home() / "sessions")
     return base / f"{sanitize_session(payload.get('session_id'))}.jsonl"
 
 
@@ -106,6 +100,7 @@ def _maybe_spawn_shadow_review(
     payload: dict[str, Any],
     journal_file: Path,
     proposal_number: int,
+    config_path: Path | None = None,
 ) -> None:
     """Fire-and-forget shadow review every N *proposals* (Wink-style cadence).
 
@@ -124,6 +119,20 @@ def _maybe_spawn_shadow_review(
     session = str(payload.get("session_id") or "")
     if not session:
         return
+    # Reserve before spawning, not after reviewing: checking a ceiling and
+    # then spending against it in a later process is not a ceiling, because
+    # concurrent sessions all read the same remaining budget (PR #58 review).
+    token, refusal = reserve(session, config.reviewer.max_per_session, config.reviewer.max_per_day)
+    if token is None:
+        # Journal it: a reviewer that stopped because it ran out of budget must
+        # not look like a reviewer with nothing to say (issues #52, #41).
+        # An unreadable ledger is a different condition from a reached ceiling
+        # and is recorded as an error, not as a cap.
+        kind = "reviewer_error" if "unreadable" in refusal else "reviewer_capped"
+        key = "error" if kind == "reviewer_error" else "reason"
+        with suppress(SnapshotError, OSError):
+            StepJournal(journal_file).record(TraceEvent(kind, {key: refusal}))
+        return
     args = [
         sys.executable,
         "-m",
@@ -133,7 +142,14 @@ def _maybe_spawn_shadow_review(
         session,
         "--model",
         config.reviewer.model,
+        # The slot is already taken; the child settles the cost against it.
+        "--reservation",
+        token,
     ]
+    if config_path is not None:
+        # Without this the child builds a default config, so the constraints
+        # the user configured never reach the reviewer (PR #58 review, P1).
+        args += ["--config", str(config_path)]
     logs = spotter_home() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     with (logs / f"review-{sanitize_session(session)}.log").open("ab") as log:
@@ -146,6 +162,9 @@ def _maybe_spawn_shadow_review(
                 start_new_session=True,
             )
         except OSError as error:
+            # The slot was taken before the spawn; a spawn that never happened
+            # must not consume budget (PR #58 review, P1).
+            cancel(session, token)
             StepJournal(journal_file).record(
                 TraceEvent("reviewer_error", {"error": f"review process failed: {error}"[:300]})
             )
@@ -187,7 +206,9 @@ def run_hook(
     else:
         decision = runtime.observe(event)
     if event.kind == "tool_proposal":
-        _maybe_spawn_shadow_review(config, payload, journal_file, adapter.last_proposal_number)
+        _maybe_spawn_shadow_review(
+            config, payload, journal_file, adapter.last_proposal_number, config_path
+        )
     if decision.allowed:
         return None  # implicit allow; stay silent on the happy path
     return json.dumps(

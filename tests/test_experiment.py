@@ -9,7 +9,8 @@ import pytest
 import spotter.experiment as experiment
 from spotter.config import GatesConfig, MainAgentConfig, ReviewerConfig, SpotterConfig
 from spotter.experiment import ArmResult, results_path, run_experiment, summarize
-from spotter.hook import run_hook, spotter_home
+from spotter.hook import run_hook
+from spotter.paths import spotter_home
 from spotter.replay import ForkPlan
 
 
@@ -166,7 +167,15 @@ def test_cadence_forwards_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path:
     )
     config_path = tmp_path / "spotter.toml"
     run_hook(_cadence_payload("PreToolUse", 0), config, config_path)
-    assert spawned and spawned[0][-2:] == ["--model", "custom-model"]
+    assert spawned
+    argv = spawned[0]
+    assert "--model" in argv and "custom-model" in argv
+    # Without --config the child builds a default config, so the constraints
+    # the user configured never reach the reviewer (PR #58 review, P1).
+    assert "--config" in argv and str(config_path) in argv
+    # the slot was taken before spawning and is identified by a token, so the
+    # child cannot claim a reservation it never received
+    assert "--reservation" in argv and len(argv[argv.index("--reservation") + 1]) == 32
 
 
 def test_failed_agent_is_not_checked_or_counted_as_success(

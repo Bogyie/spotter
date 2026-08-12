@@ -20,6 +20,8 @@ from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 from typing import Any
 
+from spotter.paths import secure_dir, spotter_home
+from spotter.redact import redact
 from spotter.trace import TraceEvent
 
 
@@ -28,15 +30,15 @@ class SnapshotError(RuntimeError):
 
 
 @contextmanager
-def global_lock(spotter_home: Path | None = None) -> Iterator[None]:
+def global_lock(spotter_home_override: Path | None = None) -> Iterator[None]:
     """Serialize snapshot-ref creation+journaling against prune.
 
     The ref exists before the journal references it; without this lock a
     concurrent prune --apply sees an unreferenced ref in that window and
     deletes a snapshot the journal is about to claim (PR #12 review, P0).
     """
-    home = spotter_home or Path(os.environ.get("SPOTTER_HOME", Path.home() / ".spotter"))
-    home.mkdir(parents=True, exist_ok=True)
+    home = spotter_home_override or spotter_home()
+    secure_dir(home)
     with (home / "lock").open("w") as handle:
         flock(handle, LOCK_EX)
         try:
@@ -162,7 +164,12 @@ class StepJournal:
                         ),
                     }
                 step = int(state["steps"])
-                payload = dict(event.payload)
+                # Redact before the record exists on disk: the journal is the
+                # durable artifact, so filtering afterwards would be too late.
+                redacted, fired = redact(dict(event.payload))
+                payload = dict(redacted) if isinstance(redacted, dict) else dict(event.payload)
+                if fired:
+                    payload["redacted"] = sorted(set(fired))
                 if event.kind == "tool_proposal":
                     state["proposals"] = int(state["proposals"]) + 1
                     payload["proposal_number"] = state["proposals"]
@@ -177,6 +184,8 @@ class StepJournal:
                     },
                     ensure_ascii=False,
                 )
+                if not self.path.exists():
+                    self.path.touch(mode=0o600)
                 with self.path.open("a", encoding="utf-8") as journal:
                     journal.write(line + "\n")
                     journal.flush()
@@ -260,7 +269,9 @@ class StepJournal:
 
 
 def snapshot_references(
-    sessions_dir: Path, repo: Path | None = None
+    sessions_dir: Path,
+    repo: Path | None = None,
+    exclude: list[Path] | None = None,
 ) -> dict[str, list[tuple[str, int]]]:
     """Map each referenced snapshot to the (session, step) pairs holding it.
 
@@ -268,8 +279,11 @@ def snapshot_references(
     to fork specific steps, and the operator is owed their names.
     """
     target = repo.resolve() if repo else None
+    skip = {p.resolve() for p in (exclude or [])}
     references: dict[str, list[tuple[str, int]]] = {}
     for journal in sorted(sessions_dir.glob("*.jsonl")):
+        if journal.resolve() in skip:
+            continue  # about to be deleted: its claims must not preserve refs
         for record in StepJournal.load(journal, strict=True):
             if not record.snapshot:
                 continue
@@ -295,6 +309,19 @@ def referenced_snapshots(sessions_dir: Path, repo: Path | None = None) -> set[st
 class PrunedRef:
     sha: str
     reason: str  # "unreferenced" | "expired"
+
+
+def stale_journals(sessions_dir: Path, max_age_days: int, now: float | None = None) -> list[Path]:
+    """Journals older than the window, by modification time.
+
+    Deleting a journal silently orphans the snapshots it references, so this
+    only *reports*; the caller must handle both together or not at all.
+    """
+    if not sessions_dir.exists():
+        return []
+    stamp = now if now is not None else time.time()
+    cutoff = stamp - max_age_days * 86400
+    return sorted(p for p in sessions_dir.glob("*.jsonl") if p.stat().st_mtime < cutoff)
 
 
 def prune_snapshots(

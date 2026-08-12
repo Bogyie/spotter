@@ -4,23 +4,38 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 import tomllib
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
-from fcntl import LOCK_EX, LOCK_NB, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
 
+from spotter.budget import (
+    LedgerCorrupt,
+    cancel,
+    charge,
+    settle,
+    spend_totals,
+)
+from spotter.budget import (
+    read as read_spend,
+)
 from spotter.codex import CodexAdapter
 from spotter.config import ConfigurationError, MainAgentConfig, ReviewerConfig, SpotterConfig
 from spotter.core import SpotterRuntime
-from spotter.experiment import results_path, run_experiment, summarize
+from spotter.doctor import FAIL, OK, WARN, worst
+from spotter.doctor import run as run_doctor
+from spotter.experiment import list_forks, results_path, run_experiment, summarize
 from spotter.gates import Gate
 from spotter.hook import journal_path, run_hook
 from spotter.labels import LabelError, add_label, valid_session
 from spotter.metrics import Tally, merge, tally_session
+from spotter.paths import secure_dir, spotter_home
+from spotter.redact import scan_text
 from spotter.replay import ReplayError, fork, plan_to_json
-from spotter.reviewer import review
+from spotter.reviewer import last_usage, review
 from spotter.snapshot import (
     SnapshotError,
     StepJournal,
@@ -28,6 +43,7 @@ from spotter.snapshot import (
     global_lock,
     prune_snapshots,
     snapshot_references,
+    stale_journals,
 )
 from spotter.trace import TraceEvent
 
@@ -47,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
             "experiment",
             "label",
             "metrics",
+            "status",
+            "doctor",
         ],
         default="observe",
         help=(
@@ -56,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
             "review: run the shadow reviewer on a session (records only, injects nothing); "
             "experiment: counterfactual fork pairs — nudge vs control (needs --run to execute); "
             "label: record a human verdict on a gate flag, reviewer decision, or session; "
-            "metrics: gate FP rate, reviewer precision and observability ceiling from labels"
+            "metrics: gate FP rate, reviewer precision and observability ceiling from labels; "
+            "status: what Spotter is storing, and whether it is actually running; "
+            "doctor: verify supervision end to end (non-zero exit when broken)"
         ),
     )
     parser.add_argument("--config", type=Path, help="path to Spotter TOML config")
@@ -68,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance", help="course-correction text for the forked run (fork)")
     parser.add_argument(
         "--apply", action="store_true", help="prune: actually delete (default is dry-run)"
+    )
+    parser.add_argument(
+        "--forks", action="store_true", help="prune: also remove orphaned fork worktrees"
+    )
+    parser.add_argument(
+        "--journals",
+        action="store_true",
+        help="prune: also remove journals past --max-age-days, with their snapshots",
     )
     parser.add_argument(
         "--max-age-days",
@@ -82,6 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pairs", type=int, default=1, help="experiment: counterfactual pairs")
     parser.add_argument("--model", help="review/experiment: pin the Codex model")
+    parser.add_argument(
+        "--reservation",
+        help="review: token for a budget slot the caller already reserved (internal)",
+    )
     parser.add_argument(
         "--check", help="experiment: success command run in each fork worktree (exit 0 = pass)"
     )
@@ -135,8 +167,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.max_age_days is not None and args.max_age_days < 1:
             parser.error("--max-age-days must be >= 1")
         return _prune_main(
-            args.repo or Path.cwd(), apply=args.apply, max_age_days=args.max_age_days
+            args.repo or Path.cwd(),
+            apply=args.apply,
+            max_age_days=args.max_age_days,
+            forks=args.forks,
+            journals=args.journals,
         )
+    if args.command == "status":
+        return _status_main()
+    if args.command == "doctor":
+        return _doctor_main(args.config)
     if args.command == "experiment":
         if not args.session or args.step is None or not args.guidance:
             parser.error("experiment requires --session, --step and --guidance")
@@ -172,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = SpotterConfig(MainAgentConfig("codex"), ReviewerConfig())
         if args.model:
             config = replace(config, reviewer=replace(config.reviewer, model=args.model))
-        return _review_main(args.session, config, window=args.window)
+        return _review_main(args.session, config, window=args.window, reservation=args.reservation)
     if args.command == "fork":
         if not args.session or args.step is None:
             parser.error("fork requires --session and --step")
@@ -270,7 +310,23 @@ def _trigger_for(records: list[StepRecord], flagged: StepRecord) -> dict[str, ob
     return {}
 
 
-def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
+def _constraints_of(config: SpotterConfig) -> list[str]:
+    """Configured constraints the reviewer is expected to judge against.
+
+    Asking a reviewer about scope drift while withholding the constraints is
+    how the previous prompt produced confident answers about nothing.
+    """
+    constraints: list[str] = []
+    if config.gates.forbidden_paths:
+        constraints.append(f"must not touch paths matching {list(config.gates.forbidden_paths)}")
+    if config.gates.block_dependency_changes:
+        constraints.append("must not change dependency manifests")
+    return constraints
+
+
+def _review_main(
+    session: str, config: SpotterConfig, *, window: int, reservation: str | None = None
+) -> int:
     """Shadow reviewer: judge the trajectory tail, journal the verdict, inject
     nothing. Injection rights are earned later via labeling + fork pairs."""
     journal_file = journal_path({"session_id": session})
@@ -281,19 +337,35 @@ def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
     try:
         flock(lock, LOCK_EX | LOCK_NB)
     except OSError:
+        # Losing this race is ordinary: two cadence children for one session
+        # both reserve, and this one never reviews. Hand the slot back.
+        cancel(session, reservation)
         print(f"review already in flight for {session}; skipping", file=sys.stderr)
         lock.close()
         return 0
     try:
         records = StepJournal.load(journal_file)
     except (OSError, SnapshotError) as error:
+        cancel(session, reservation)  # nothing was reviewed and nothing was spent
         print(f"review failed: {error}", file=sys.stderr)
         return 1
     if not records:
+        cancel(session, reservation)
         print("review failed: empty journal", file=sys.stderr)
         return 1
     try:
-        decision = review(records, config.reviewer.model, window=window)
+        # Check the ledger before spending, not after: the manual path calls
+        # the model first, so a corrupt ledger would otherwise pay for a review
+        # and then overwrite the history proving a ceiling was hit.
+        read_spend(session)
+    except LedgerCorrupt as error:
+        print(f"review refused: {error}", file=sys.stderr)
+        return 1
+    constraints = _constraints_of(config)
+    try:
+        decision, digest = review(
+            records, config.reviewer.model, window=window, constraints=constraints
+        )
     except Exception as error:  # noqa: BLE001 — reviewer failure must stay observable, not fatal
         print(f"review failed: {error}", file=sys.stderr)
         # Failure evidence belongs in the journal too — "no verdict" must be
@@ -303,6 +375,11 @@ def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
                 TraceEvent("reviewer_error", {"error": str(error)[:300]})
             )
         return 1
+    # A reserved slot was already counted by the caller; charging again would
+    # double-count it. An unrecognised token means no slot was ever taken, so
+    # the review is charged normally — otherwise passing the flag would be
+    # enough to review for free.
+    spend = settle(session, reservation, last_usage()) or charge(session, last_usage())
     StepJournal(journal_file).record(
         TraceEvent(
             "reviewer_decision",
@@ -315,13 +392,182 @@ def _review_main(session: str, config: SpotterConfig, *, window: int) -> int:
                 "model": config.reviewer.model,
                 "reviewed_upto": records[-1].step,
                 "shadow": True,
+                # What the reviewer could actually see when it judged: a verdict
+                # made on a truncated view or with no goal must stay identifiable.
+                "inputs": digest.provenance(),
+                "spend": {"session_reviews": spend.session, "session_tokens": spend.tokens},
             },
         )
     )
+    notes = []
+    if not digest.goal_present:
+        notes.append("no goal recorded")
+    if digest.truncated:
+        notes.append(f"truncated to {digest.steps_shown} steps")
+    if digest.injection_suspected:
+        notes.append("possible injection in trajectory text")
+    notes.append(f"review {spend.session} this session, {spend.tokens} tokens")
+    suffix = f"  [{'; '.join(notes)}]" if notes else ""
     print(
         f"[shadow] {decision.decision} ({decision.failure_class}, "
-        f"conf={decision.confidence:.2f}): {decision.reason}"
+        f"conf={decision.confidence:.2f}): {decision.reason}{suffix}"
     )
+    return 0
+
+
+def _delete_journal(journal: Path, cutoff: float) -> bool:
+    """Remove a journal and its state while no writer or reviewer is active.
+
+    Staleness is re-checked *after* the lock is acquired. Holding the lock
+    proves no one is writing right now; it says nothing about whether the
+    journal was still stale by the time the wait ended. A writer that appended
+    while this call was blocked has made the file current, and deleting it
+    then would destroy a live session's record (PR #58 review, P0).
+
+    Returns whether the journal was actually removed, because the caller must
+    exclude exactly the deleted set from reference computation — excluding a
+    journal that survived would prune snapshots it still points at.
+
+    The lock file itself is deliberately left behind. Removing it — even last —
+    does not remove the writers already blocked on the old inode: one wakes on
+    the unlinked inode while the next writer creates a fresh file at the same
+    path, and two processes holding locks on different inodes are serialised
+    by nothing (PR #58 review, P0). An empty lock file is a few bytes; a
+    corrupted journal is the evidence base for every published rate.
+    """
+    review_lock_path = journal.with_suffix(".review.lock")
+    try:
+        review_handle = review_lock_path.open("a")
+    except OSError:
+        return False
+    try:
+        flock(review_handle, LOCK_EX | LOCK_NB)
+    except OSError:
+        review_handle.close()
+        return False
+
+    lock_path = journal.with_suffix(journal.suffix + ".lock")
+    try:
+        handle = lock_path.open("a")
+        try:
+            flock(handle, LOCK_EX)
+            if not journal.exists() or journal.stat().st_mtime >= cutoff:
+                return False  # became current while we waited
+            journal.unlink(missing_ok=True)
+            journal.with_suffix(journal.suffix + ".state").unlink(missing_ok=True)
+            return True
+        finally:
+            flock(handle, LOCK_UN)
+            handle.close()
+    except OSError:
+        return False
+    finally:
+        flock(review_handle, LOCK_UN)
+        review_handle.close()
+
+
+def _remove_worktree(worktree: Path) -> None:
+    """Remove a fork worktree through git so its administrative entry goes too.
+
+    A plain rmtree leaves the parent repository listing a worktree that no
+    longer exists, which then blocks reuse of that path.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "worktree", "remove", "--force", str(worktree)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Deleting the directory anyway would leave the parent repository
+        # registering a worktree that no longer exists — precisely the defect
+        # this command exists to fix (PR #58 review, P1).
+        print(
+            f"  could not remove {worktree.name}: {result.stderr.strip()[:160]}",
+            file=sys.stderr,
+        )
+
+
+def _doctor_main(config_path: Path | None) -> int:
+    """Report whether supervision works, and exit non-zero when it does not.
+
+    A tool whose normal output is silence needs one command that speaks.
+    """
+    checks = run_doctor(config_path)
+    marks = {OK: "  ok  ", WARN: " warn ", FAIL: " FAIL "}
+    for check in checks:
+        print(f"[{marks[check.status]}] {check.name}: {check.detail}")
+    verdict = worst(checks)
+    if verdict == FAIL:
+        print("\nsupervision is NOT working", file=sys.stderr)
+        return 2
+    if verdict == WARN:
+        print("\nsupervision works, with warnings above", file=sys.stderr)
+        return 1
+    print("\nsupervision is working")
+    return 0
+
+
+def _status_main() -> int:
+    """What Spotter is storing, and whether it is actually observing.
+
+    Silence is Spotter's designed normal state, which is why silence cannot
+    also be its failure state (issue #41).
+    """
+    home = spotter_home()
+    if not home.exists():
+        print(f"no spotter home at {home} — nothing has ever been recorded", file=sys.stderr)
+        return 1
+    sessions_dir = home / "sessions"
+    journals = sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []
+    total_bytes = sum(p.stat().st_size for p in home.rglob("*") if p.is_file())
+    newest = max((p.stat().st_mtime for p in journals), default=None)
+
+    # status is where a wrong posture gets fixed, not merely reported: a
+    # journal of command history should never have been group-readable.
+    before = home.stat().st_mode & 0o777
+    secure_dir(home)
+    after = home.stat().st_mode & 0o777
+    note = f" (tightened from {oct(before)})" if before != after else ""
+    print(f"home: {home}  ({total_bytes / 1e6:.1f} MB, mode {oct(after)}{note})")
+    print(f"sessions: {len(journals)}")
+    if newest is None:
+        print("  last observation: never")
+    else:
+        age_hours = (time.time() - newest) / 3600
+        print(f"  last observation: {age_hours:.1f}h ago")
+        if age_hours > 24:
+            print("  WARNING: nothing observed in over a day — is the hook still registered?")
+    forks = list_forks()
+    if forks:
+        print(f"fork worktrees: {len(forks)} (remove with: spotter prune --forks --apply)")
+    errors = 0
+    exposed = 0
+    for journal in journals:
+        try:
+            records = StepJournal.load(journal)
+        except SnapshotError:
+            print(f"  UNREADABLE: {journal.name}")
+            errors += 1
+            continue
+        errors += sum(1 for r in records if r.event.kind == "reviewer_error")
+        exposed += sum(
+            1 for line in journal.read_text(errors="replace").splitlines() if scan_text(line)
+        )
+    if errors:
+        print(f"reviewer errors recorded: {errors} (see {home / 'logs'})")
+    try:
+        totals = spend_totals()
+    except LedgerCorrupt as error:
+        # The diagnostic command must survive the corruption it is diagnosing.
+        print(f"WARNING: spend ledger unreadable ({error}); ceilings are refusing to spend")
+    else:
+        if totals is not None:
+            print(f"reviews today: {totals['day']}  |  tokens recorded: {totals['tokens']}")
+    if exposed:
+        print(
+            f"WARNING: {exposed} pre-redaction lines match credential patterns; "
+            "these journals predate redaction"
+        )
     return 0
 
 
@@ -392,7 +638,14 @@ def _metrics_main(session: str | None) -> int:
     return 0
 
 
-def _prune_main(repo: Path, *, apply: bool, max_age_days: int | None = None) -> int:
+def _prune_main(
+    repo: Path,
+    *,
+    apply: bool,
+    max_age_days: int | None = None,
+    forks: bool = False,
+    journals: bool = False,
+) -> int:
     """Drop refs/spotter/steps/* that no journal references (issue #7).
 
     Dry-run by default: deleting a snapshot is the one spotter operation that
@@ -401,14 +654,56 @@ def _prune_main(repo: Path, *, apply: bool, max_age_days: int | None = None) -> 
     journaled it.
     """
     sessions_dir = journal_path({"session_id": "probe"}).parent
+    verb = "deleted" if apply else "would delete (pass --apply)"
+    if journals and max_age_days is None:
+        print("--journals requires --max-age-days", file=sys.stderr)
+        return 1
     try:
+        # Everything that reads or removes journals and refs happens under one
+        # lock: selecting stale journals, deleting them, recomputing what is
+        # still referenced, and pruning. Releasing between those steps lets a
+        # hook append to a journal being deleted, or pin a ref this pass has
+        # already decided is unreferenced (PR #58 review, P0).
         with global_lock():
-            references = snapshot_references(sessions_dir, repo)
+            cutoff = time.time() - (max_age_days or 0) * 86400
+            doomed = (
+                stale_journals(sessions_dir, max_age_days)
+                if journals and max_age_days is not None
+                else []
+            )
+            removed: list[Path] = []
+            for journal in doomed:
+                if apply:
+                    if _delete_journal(journal, cutoff):
+                        removed.append(journal)
+                        print(f"journal {verb}: {journal.stem}")
+                    else:
+                        print(f"journal kept (written while pruning): {journal.stem}")
+                else:
+                    print(f"journal {verb}: {journal.stem}")
+            # Reference computation happens after deletion, so a journal that
+            # is going away cannot keep its snapshots alive — and, crucially,
+            # snapshots are pruned exactly once, after that. The previous
+            # version pruned before deleting and then again after, which is
+            # the opposite of what its own comment claimed.
+            #
+            # In dry-run the journals are still on disk, so they are excluded
+            # logically instead: a preview that omits the snapshots an apply
+            # would orphan is a preview of a different operation. Under --apply
+            # the exclusion is the set actually removed, so a journal that
+            # survived the staleness re-check keeps its snapshots.
+            references = snapshot_references(
+                sessions_dir, repo, exclude=removed if apply else doomed
+            )
             pruned = prune_snapshots(repo, set(references), apply=apply, max_age_days=max_age_days)
     except SnapshotError as error:
         print(f"prune aborted: {error}", file=sys.stderr)
         return 1
-    verb = "deleted" if apply else "would delete (pass --apply)"
+    if forks:
+        for worktree in list_forks():
+            print(f"fork worktree {verb}: {worktree.name}")
+            if apply:
+                _remove_worktree(worktree)
     print(f"{len(references)} snapshots referenced by journals; {verb} {len(pruned)} refs")
     for pruned_ref in pruned:
         print(f"  {pruned_ref.sha} ({pruned_ref.reason})")
