@@ -1,6 +1,5 @@
 name: Architecture / design
 description: Propose a change to ownership, interfaces, lifecycle, state, or runtime boundaries.
-labels: ["type:architecture"]
 body:
   - type: textarea
     id: problem
