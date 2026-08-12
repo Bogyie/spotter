@@ -1,5 +1,6 @@
 name: Bug report
 description: Something is broken or behaves differently from the intended contract.
+labels: ["type:bug"]
 body:
   - type: textarea
     id: problem
