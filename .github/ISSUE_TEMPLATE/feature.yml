@@ -1,6 +1,5 @@
 name: Feature request
 description: Propose a new capability or user/developer-facing behavior.
-labels: ["type:feature"]
 body:
   - type: textarea
     id: problem
