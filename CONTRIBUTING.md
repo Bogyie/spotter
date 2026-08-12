@@ -9,8 +9,8 @@ Use the repository docs to avoid solving the wrong layer of the problem:
 - [`docs/status.md`](docs/status.md) — what exists now and what is blocked
 - [`docs/architecture.md`](docs/architecture.md) — runtime boundaries and component contracts
 - [`docs/lifecycle.md`](docs/lifecycle.md) — install/setup/update/remove behavior
-- [`docs/roadmap.md`](docs/roadmap.md) — implementation order and phase gates
-- [`docs/conventions.md`](docs/conventions.md) — code, branch, commit, test, and documentation conventions
+- [`docs/roadmap.md`](docs/roadmap.md) — named roadmap stages and evidence gates
+- [`docs/conventions.md`](docs/conventions.md) — code, issue, label, branch, commit, test, and documentation conventions
 
 For agent-assisted work, also read [`AGENTS.md`](AGENTS.md).
 
@@ -35,6 +35,24 @@ Open an experiment issue when the main output is evidence rather than product be
 ### Documentation-only change
 
 A dedicated issue is optional unless the documentation change represents a new project decision.
+
+## Issue triage
+
+Purpose-specific issue forms automatically add the matching `type:*` label. During triage, maintainers add:
+
+- exactly one `priority:*`;
+- usually one primary `area:*`;
+- `status:blocked` only when meaningful work cannot proceed.
+
+Do not encode roadmap stage numbers in issue titles or labels. The roadmap is intentionally named:
+
+```text
+Runtime → Observe → Detect → Intervene → Recover → Harden
+```
+
+The canonical label catalog is [`.github/labels.json`](.github/labels.json) and is synchronized by [`.github/workflows/sync-labels.yml`](.github/workflows/sync-labels.yml). Add or remove repository labels through that catalog rather than creating ad-hoc labels in the GitHub UI.
+
+Detailed rules and priority semantics are in [`docs/conventions.md`](docs/conventions.md#13-issue-labels-and-triage).
 
 ## Local setup
 
@@ -94,7 +112,7 @@ The issue picker provides purpose-specific forms for:
 - documentation
 - maintenance / chores
 
-Use a blank issue when none of the forms fit. The forms are intentionally lightweight; add detail only where it helps someone make a decision or reproduce a result.
+Blank issues remain available when none of the forms fit. The forms are intentionally lightweight; add detail only where it helps someone make a decision or reproduce a result.
 
 ## Review expectations
 
