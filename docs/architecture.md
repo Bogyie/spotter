@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status:** this document describes both the current hook-based prototype and the target architecture tracked in [#66](https://github.com/spotter-agent/spotter/issues/66).
+> **Status:** this document describes both the current hook-based prototype and the target architecture. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.
 > `spotterd`, App Server primary observation, and live `turn/steer` delivery are **target behavior**, not current shipping behavior.
 
 ---

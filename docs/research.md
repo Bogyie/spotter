@@ -8,7 +8,7 @@ The central Spotter claim remains unproven:
 
 > **Runtime intervention improves coding-agent outcomes more than it harms them, at an acceptable cost.**
 
-The standalone-runtime direction in [#66](https://github.com/spotter-agent/spotter/issues/66) changes the observation/control substrate used to test that claim. It does not count as evidence for the claim by itself.
+The standalone-runtime direction described in [Architecture](architecture.md) and tracked through the [Roadmap](roadmap.md) changes the observation/control substrate used to test that claim. It does not count as evidence for the claim by itself.
 
 ---
 

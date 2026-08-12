@@ -1,6 +1,6 @@
 # Lifecycle and Operations
 
-> **Status:** target design tracked by [#66](https://github.com/spotter-agent/spotter/issues/66).
+> **Status:** target design. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.
 > The current prototype is still hook/plugin-centered. Commands such as Homebrew installation, managed `spotterd`, and full App Server integration described here are the **intended product lifecycle**, not current shipping behavior.
 
 ---
