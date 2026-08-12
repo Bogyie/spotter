@@ -57,7 +57,19 @@ Before building the standalone daemon around App Server assumptions, prove the c
 
 If no viable path passes, revise the architecture before proceeding.
 
-In parallel, the highest-value evidence foundations are:
+If the gate passes, the immediate implementation boundaries are already split into native GitHub issues:
+
+- [#79](https://github.com/spotter-agent/spotter/issues/79) — `spotterd`, local control RPC, and per-user service lifecycle;
+- [#80](https://github.com/spotter-agent/spotter/issues/80) — production App Server client and capability negotiation;
+- [#81](https://github.com/spotter-agent/spotter/issues/81) — Thread / Turn / Runtime Attachment identity;
+- [#82](https://github.com/spotter-agent/spotter/issues/82) — bounded fail-open `PreToolUse` ↔ daemon enforcement IPC;
+- [#83](https://github.com/spotter-agent/spotter/issues/83) — transactional Codex setup/teardown and integration ownership;
+- [#84](https://github.com/spotter-agent/spotter/issues/84) — runtime-aware status/doctor;
+- [#87](https://github.com/spotter-agent/spotter/issues/87) — daemon/App Server reconnect and identity reconciliation.
+
+[#31](https://github.com/spotter-agent/spotter/issues/31) then moves independent supervision state into that runtime, fed by the App Server ingestion path in [#85](https://github.com/spotter-agent/spotter/issues/85).
+
+In parallel, the highest-value evidence foundations remain:
 
 - [#21](https://github.com/spotter-agent/spotter/issues/21) — mechanically scored task set;
 - [#42](https://github.com/spotter-agent/spotter/issues/42) — replay/fork fidelity and noise floor;
@@ -72,21 +84,24 @@ Legend: ✅ implemented · 🟡 partial/shadow · 🧪 proof required · 🎯 ta
 
 | Area | Status | What exists now | Next concrete step |
 | --- | --- | --- | --- |
-| Hook ingestion | ✅ | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` are journaled | Replace broad observation with App Server events after #78 |
-| Deterministic gate | ✅ | Shell-aware checks for destructive commands, path/dependency constraints, fail-open ambiguity handling | Move bounded enforcement behind daemon IPC and re-measure latency |
-| Journal | ✅ | Crash-tolerant JSONL, locking, fsync, torn-tail recovery | Keep as durable history/recovery, not hot state |
-| Snapshot | ✅ | Git-backed snapshots, deduplication, pruning, detached restore | Integrate into managed runtime lifecycle |
+| Hook ingestion | ✅ | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` are journaled | App Server ingestion #85, then remove redundant Hooks in #86 |
+| Deterministic gate | ✅ | Shell-aware checks for destructive commands, path/dependency constraints, fail-open ambiguity handling | Move bounded enforcement behind daemon IPC in #82 |
+| Journal | ✅ | Crash-tolerant JSONL, locking, fsync, torn-tail recovery | Feed it from identity-rich App Server Trace IR in #85 |
+| Snapshot | ✅ | Git-backed snapshots, deduplication, pruning, detached restore | Preserve lineage through runtime/retention migration (#89) |
 | Fork / replay | ✅ | Continue Codex from a shared prefix in a detached worktree | Measure fidelity/noise floor in #42 |
 | Shadow reviewer | ✅ | Produces `CONTINUE`, `VERIFY`, `NUDGE`; verdicts are recorded only | Move to event-driven candidates, then live delivery |
 | Audit ledger | 🟡 | Claim/evidence state and stale propagation where outcomes are observable | Move independent state into `spotterd` (#31) |
 | Evaluation labels / metrics | ✅ | Coverage-aware labeling and precision/FP metrics | Broader cost/miss/harm metrics (#33, #38, #34) |
 | Counterfactual harness | ✅ | Control/guidance same-prefix pairs can be prepared/run | Add mechanically scored tasks (#21) |
-| Standalone runtime | ❌ | No long-lived owner of live supervision state | Resolve #78, then build runtime boundary |
-| App Server primary observation | 🧪 | Target design only | Prove shared-server path in #78 |
+| Standalone runtime | ❌ | No long-lived owner, service boundary, or runtime RPC | #79 after #78; App Server transport in #80 |
+| Runtime identity | ❌ | Hook-era `session_id` is the dominant identity | Thread/Turn/Attachment model in #81 |
+| App Server primary observation | 🧪 | Target design only | Prove #78, then implement #80 + #85 |
+| Managed Codex lifecycle | ❌ | Current path is source/plugin installation | transactional setup/teardown in #83; diagnostics in #84 |
+| Runtime reconnect/recovery | ❌ | No long-lived App Server connection to recover | #87 after runtime/state boundaries exist |
 | Event-driven detection | ❌ | Reviewer is still cadence-based | #28 after Runtime/Observe |
 | Live `VERIFY` / `NUDGE` | ❌ | Reviewer decisions stop at the journal | #22 via `turn/steer` |
 | `INTERRUPT` / `RESTART` | ❌ | No live recovery path | #26 + #30 after soft intervention is understood |
-| Product lifecycle | 🎯 | Current paths are source/plugin installs | standalone setup/status/doctor/teardown under Runtime/Harden |
+| Packaging / long-term operations | 🎯 | Current paths are source/plugin installs; local `prune` exists | #88 packaging, #89 purge/retention, #90 upgrade/config lifecycle |
 
 ---
 
