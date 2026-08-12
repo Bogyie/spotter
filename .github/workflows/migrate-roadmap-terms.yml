@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Replace deprecated phase vocabulary
+      - name: Replace deprecated phase vocabulary and remove this migration
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -46,18 +46,18 @@ jobs:
           for filename, mapping in replacements.items():
               path = Path(filename)
               text = path.read_text()
-              original = text
               text = text.replace(old_repo, new_repo)
               for old, new in mapping.items():
                   if old not in text:
                       raise SystemExit(f"expected text not found in {filename}: {old}")
                   text = text.replace(old, new)
-              if text != original:
-                  path.write_text(text)
+              text = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+              path.write_text(text)
           PY
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/migrate-roadmap-terms.yml
           git add docs/architecture.md docs/lifecycle.md docs/research.md
           git diff --cached --check
           git commit -m "docs: remove deprecated roadmap phase codes"
