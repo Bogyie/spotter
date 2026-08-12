@@ -12,7 +12,7 @@ Start here if you are reading the repository for the first time.
 | What happens from install through uninstall/reinstall? | [Lifecycle](lifecycle.md) | command-by-command operational lifecycle |
 | What should become trustworthy next? | [Roadmap](roadmap.md) | Runtime → Observe → Detect → Intervene → Recover → Harden, with evidence gates |
 | Which papers/ideas inform the design, and what remains unproven? | [Research](research.md) | literature-to-mechanism map + evidence questions |
-| How should code, issues, labels, branches, commits, tests, and docs be structured? | [Conventions](conventions.md) | repository-wide working conventions |
+| How should code, issue metadata, branches, commits, tests, and docs be structured? | [Conventions](conventions.md) | repository-wide working conventions |
 | How do I contribute? | [Contributing](../CONTRIBUTING.md) | issue/PR workflow, setup, triage, and review expectations |
 
 ## Recommended reading paths
@@ -91,7 +91,7 @@ The project intentionally does not use numeric phase codes as the primary vocabu
 Runtime → Observe → Detect → Intervene → Recover → Harden
 ```
 
-These names describe the product/evidence outcome being made trustworthy. Issue priority remains separate and is expressed through `priority:*` labels.
+These names describe the product/evidence outcome being made trustworthy. GitHub Milestone carries the stage assignment; Priority, Effort, Area, and native dependencies answer separate triage questions.
 
 ## Document responsibilities
 
@@ -103,7 +103,7 @@ To avoid maintaining duplicate specifications:
 - **Lifecycle** owns package/service/integration/session/update/removal behavior.
 - **Roadmap** owns named stages, dependencies, and evidence gates.
 - **Research** owns prior work, hypotheses, evidence, and evaluation questions.
-- **Conventions** owns repository-wide code/test/git/issue/label/documentation conventions.
+- **Conventions** owns repository-wide code/test/git/issue-metadata/documentation conventions.
 - **Contributing** owns the human contribution workflow.
 
 When a detail belongs to another document, link to it rather than maintaining two competing definitions.
