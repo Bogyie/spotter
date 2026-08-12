@@ -79,7 +79,7 @@ Legend: ✅ implemented · 🟡 partial/shadow · 🧪 proof required · 🎯 ta
 | Fork / replay | ✅ | Continue Codex from a shared prefix in a detached worktree | Measure fidelity/noise floor in #42 |
 | Shadow reviewer | ✅ | Produces `CONTINUE`, `VERIFY`, `NUDGE`; verdicts are recorded only | Move to event-driven candidates, then live delivery |
 | Audit ledger | 🟡 | Claim/evidence state and stale propagation where outcomes are observable | Move independent state into `spotterd` (#31) |
-| Labels / metrics | ✅ | Coverage-aware labeling and precision/FP metrics | New repository label taxonomy + broader cost/miss/harm metrics |
+| Evaluation labels / metrics | ✅ | Coverage-aware labeling and precision/FP metrics | Broader cost/miss/harm metrics (#33, #38, #34) |
 | Counterfactual harness | ✅ | Control/guidance same-prefix pairs can be prepared/run | Add mechanically scored tasks (#21) |
 | Standalone runtime | ❌ | No long-lived owner of live supervision state | Resolve #78, then build runtime boundary |
 | App Server primary observation | 🧪 | Target design only | Prove shared-server path in #78 |
@@ -141,16 +141,22 @@ A mechanism being implemented does not prove it improves outcomes. Null and nega
 
 ## Issue triage
 
-Repository issues use a small label vocabulary defined in [Repository Conventions](conventions.md) and `.github/labels.json`.
+Repository issues use GitHub native metadata rather than label namespaces:
 
-The useful filters are:
+- **Type** — work nature (`Task`, `Bug`, `Feature`, `Architecture`, `Experiment`);
+- **Priority** — current sequencing pressure (`Urgent`, `High`, `Medium`, `Low`);
+- **Effort** — change surface / validation burden (`XS`–`XL`);
+- **Area** — primary product/problem domain;
+- **Milestone** — roadmap stage owning completion;
+- **Dependencies** — actual `blocked by` / `blocking` relationships.
 
-- `type:*` — what kind of work is this?
-- `priority:*` — how urgently should it be selected?
-- `area:*` — which part of Spotter does it belong to?
-- `status:blocked` — is meaningful progress currently blocked?
+The Milestones are the named roadmap outcomes:
 
-Roadmap stages are **not labels**. They are durable product/evidence outcomes; priorities are expected to change as the project advances.
+```text
+Runtime → Observe → Detect → Intervene → Recover → Harden
+```
+
+Labels are exceptional contributor signals only (`good first issue`, `help wanted` today). Detailed semantics live in [Repository Conventions](conventions.md#13-issue-metadata-and-triage).
 
 ---
 
