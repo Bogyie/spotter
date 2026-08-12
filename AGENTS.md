@@ -20,7 +20,7 @@ The roadmap uses named outcomes rather than numbered phases:
 Runtime → Observe → Detect → Intervene → Recover → Harden
 ```
 
-Issue selection should follow the issue's `priority:*` and dependency state, not a guessed numeric phase.
+Issue selection should follow native **Priority**, **Milestone**, and dependency state rather than a guessed numeric phase.
 
 ## Working rules
 
@@ -31,7 +31,7 @@ Issue selection should follow the issue's `priority:*` and dependency state, not
 5. **Preserve durable-state safety.** Do not weaken journal, snapshot, ref, worktree, or migration guarantees without a deliberate design change.
 6. **Separate implementation from evidence.** A mechanism being implemented does not prove it improves outcomes.
 7. **Update docs when contracts change.** Architecture/lifecycle/roadmap/status changes should land with the code that changes them.
-8. **Respect issue triage.** Do not add ad-hoc repository labels; the canonical label catalog is `.github/labels.json`.
+8. **Respect issue triage.** Use GitHub native Type, Priority, Effort, Area, Milestone, and dependencies. Labels are only exceptional contributor/cross-cutting signals.
 
 ## Where changes usually belong
 
@@ -47,7 +47,7 @@ Issue selection should follow the issue's `priority:*` and dependency state, not
 | Snapshot / fork / replay | snapshot/replay/experiment modules and Git helpers |
 | Metrics / labels | `src/spotter/metrics.py`, `src/spotter/labels.py` |
 | Runtime architecture direction | `docs/architecture.md`, `docs/lifecycle.md`, `docs/roadmap.md` |
-| Repository issue labels | `.github/labels.json`, `docs/conventions.md` |
+| Repository issue metadata | GitHub native metadata; `docs/conventions.md` |
 
 If the right boundary is unclear, inspect nearby tests before creating a new abstraction.
 
