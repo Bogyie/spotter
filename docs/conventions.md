@@ -17,7 +17,7 @@ The goal is consistency where consistency saves review time, not ceremony for it
 | Docs | English; current state and target design must be distinguishable |
 | Architecture | Agent transport behind adapters; semantic review async; deterministic gates bounded |
 | Persisted state | Version contracts; migrate or refuse explicitly |
-| Issues | One `type:*`, one `priority:*`, usually one `area:*`; `status:*` only when informative |
+| Issues | Native Type + Priority + Effort + Area + Milestone + dependencies; labels exceptional |
 | Roadmap | Named outcomes: Runtime → Observe → Detect → Intervene → Recover → Harden |
 
 ---
@@ -119,7 +119,7 @@ Anything persisted beyond one process run is a contract.
 Examples:
 
 - journals
-- labels / metrics metadata
+- evaluation labels / metrics metadata
 - experiment metadata
 - integration manifests
 - configuration schemas
@@ -268,87 +268,106 @@ Use the closest purpose-specific template and remove irrelevant optional section
 
 Architecture-changing PRs should identify changed ownership/boundaries. Research PRs should identify the evidence generated. Documentation PRs should state whether they describe current behavior or target direction.
 
-## 13. Issue labels and triage
+## 13. Issue metadata and triage
 
-Labels exist to make a query or triage decision easier. Do not add a label merely because a fact can be encoded.
+Prefer GitHub's structured issue metadata over label namespaces. Each dimension should answer a different recurring question; do not duplicate the same fact in labels or issue-body boilerplate.
 
-The canonical catalog is `.github/labels.json`. `.github/workflows/sync-labels.yml` reconciles the repository to that catalog, including removing labels that are no longer part of the convention.
+### Issue Type — what kind of work is this?
 
-### Type
+Every maintained open issue should have one native Issue Type after triage.
 
-Every maintained open issue should have exactly one `type:*` label.
-
-| Label | Use |
+| Type | Use |
 | --- | --- |
-| `type:bug` | incorrect behavior, regression, broken contract |
-| `type:feature` | new user/developer-facing capability |
-| `type:architecture` | ownership, lifecycle, interface, state, or runtime-boundary decision |
-| `type:experiment` | research/evaluation whose primary output is evidence |
-| `type:maintenance` | tooling, packaging, cleanup, dependencies, repository operations |
-| `type:docs` | documentation-only change |
+| `Bug` | incorrect behavior, regression, or broken contract |
+| `Feature` | new user- or developer-facing capability |
+| `Architecture` | ownership, lifecycle, interface, state, or runtime-boundary decision |
+| `Experiment` | research/evaluation whose primary output is evidence |
+| `Task` | maintenance, documentation, tooling, packaging, community work, or other bounded work |
 
-Issue forms apply the matching type automatically. A blank issue should receive a type during triage.
+Do not create extra types merely to mirror every PR/branch category.
 
-### Priority
+### Priority — what deserves attention next?
 
-Every maintained open issue should have exactly one `priority:*` label after triage.
+Every maintained open issue should normally have one Priority after triage.
 
-| Label | Meaning |
+| Priority | Meaning |
 | --- | --- |
-| `priority:blocker` | the current roadmap stage cannot advance until this is resolved |
-| `priority:high` | current/immediately-next critical path or parallel evidence needed soon |
-| `priority:normal` | planned work with no immediate sequencing pressure |
-| `priority:low` | useful but non-critical, distant-stage, opportunistic, or external/community work |
+| `Urgent` | the current critical path or roadmap stage cannot meaningfully advance until this is resolved |
+| `High` | current/immediately-next work or parallel evidence needed soon |
+| `Medium` | planned work with no immediate sequencing pressure |
+| `Low` | useful but distant, opportunistic, external, or community work |
 
-Priority is intentionally **not** a roadmap phase. It can change as dependencies change.
+Priority is intentionally **not** a roadmap stage. It may change as dependencies and evidence change.
 
-Keep `blocker` rare. Do not use `high` as the default value; if most open issues are high priority, the label no longer helps choose work.
+Keep `Urgent` rare. If most open issues are `High`, priority has stopped helping choose work.
 
-### Area
+### Effort — how large/uncertain is the change?
 
-Use one primary `area:*` label in most cases. Add a second only when the issue genuinely spans two independently useful filters.
+Effort is a rough measure of **change surface, validation difficulty, and uncertainty**, not a promise about elapsed time.
 
-| Label | Scope |
+| Effort | Meaning |
 | --- | --- |
-| `area:runtime` | `spotterd`, App Server integration, adapters, IPC, live runtime state |
-| `area:observation` | event ingestion, Trace IR, audit evidence, observability |
-| `area:detection` | signals, reviewer judgment, detection policy/quality |
-| `area:intervention` | VERIFY/NUDGE/BLOCK delivery, supervision UX/provenance |
-| `area:recovery` | interrupt, restart, snapshots, reversibility, side effects |
-| `area:evaluation` | task sets, experiments, replay measurement, metrics, statistics, A/B |
-| `area:operations` | install/setup/update, schemas, retention, cleanup, diagnostics |
-| `area:community` | OSS programs, showcases, ecosystem listings, outreach |
+| `XS` | trivial/local change with obvious validation |
+| `S` | one bounded component or simple external task |
+| `M` | several modules/tests/docs or moderate uncertainty |
+| `L` | crosses a runtime/architecture/E2E boundary |
+| `XL` | broad or uncertain enough that splitting should be considered |
 
-Roadmap stages are not encoded as labels. `Runtime → Observe → Detect → Intervene → Recover → Harden` lives in `docs/roadmap.md`; area labels are stable code/product filters.
+AI-assisted implementation can change wall-clock time dramatically; the scope and proof burden remain useful planning signals.
 
-### Status
+### Area — where does the problem primarily live?
 
-`status:blocked` is the only custom status label.
+Use one primary Area in most cases.
 
-Use it only when **meaningful progress on the issue cannot continue** until a dependency, decision, capability, or external condition changes. Do not use it merely because another issue is related.
+| Area | Scope |
+| --- | --- |
+| `Runtime` | `spotterd`, App Server integration, adapters, IPC, live runtime state |
+| `Observation` | event ingestion, Trace IR, audit evidence, observability |
+| `Detection` | signals, reviewer judgment, detection policy/quality |
+| `Intervention` | VERIFY/NUDGE/BLOCK delivery, supervision UX/provenance |
+| `Recovery` | interrupt, restart, snapshots, reversibility, side effects |
+| `Evaluation` | task sets, experiments, replay measurement, metrics, statistics, A/B |
+| `Operations` | install/setup/update, schemas, retention, cleanup, diagnostics |
+| `Community` | OSS programs, showcases, ecosystem listings, outreach |
 
-Open/closed, duplicate, and not-planned state should use GitHub's native issue state/close reason instead of labels such as `duplicate`, `wontfix`, or `deferred`.
+Area should stay relatively stable as roadmap priority changes.
 
-### Contributor labels
+### Milestone — which roadmap outcome owns completion?
 
-Keep the GitHub-standard labels:
+Use the native GitHub Milestones:
+
+```text
+Runtime → Observe → Detect → Intervene → Recover → Harden
+```
+
+The Milestone is the stage whose completion/evidence gate needs the issue done. It does not mean the issue benefits only that stage. Cross-cutting infrastructure can therefore have an earlier Milestone than some of its consumers.
+
+Community/outreach work does not need a roadmap Milestone when it is independent of product maturity.
+
+The detailed stage meaning and evidence gates live in `docs/roadmap.md`; GitHub Milestones are the source of truth for issue-to-stage assignment.
+
+### Dependencies — what is actually blocked?
+
+Use GitHub's native `blocked by` / `blocking` relationships when an issue cannot meaningfully complete until another issue resolves.
+
+Do not encode a dependency merely because:
+
+- two issues are related;
+- one would be convenient to do first;
+- they share a Milestone or Area.
+
+Native dependency state replaces a custom `status:blocked` label.
+
+### Labels — exceptional signals only
+
+Labels are no longer the primary issue taxonomy. Keep the standard contributor-discovery labels:
 
 - `good first issue` — small and well-bounded for a new contributor;
 - `help wanted` — maintainers explicitly welcome outside help.
 
-These are opt-in signals, not required dimensions.
+Add a future label only when it expresses a recurring cross-cutting distinction that Type, Priority, Effort, Area, Milestone, dependencies, assignees, or issue state cannot represent cleanly.
 
-### Labels intentionally not used
-
-Do not recreate:
-
-- numbered `tier-*` priority schemes;
-- temporary `batch-*` implementation groups;
-- provider labels such as `codex` while nearly the whole project targets that provider;
-- agent/tool ownership labels such as `Amazon Q development agent`;
-- `duplicate`, `invalid`, `wontfix`, or `deferred` when GitHub native state already carries the information.
-
-If a future category becomes useful, add it because it enables a recurring query or decision—not because one issue happens to need a description.
+Use GitHub's native open/closed state and close reasons for duplicate/not-planned outcomes instead of recreating status labels.
 
 ## 14. Issue conventions
 
@@ -365,4 +384,4 @@ acceptance or evidence criteria
 
 Use sub-issues or follow-up issues rather than growing one implementation ticket into an unbounded backlog. Umbrella issues are appropriate for architecture/direction when they explicitly delegate concrete work.
 
-Use issue titles to describe the work itself. Do not prefix titles with roadmap codes such as `[P6]` or `[E4]`; sequencing belongs in the roadmap and priority labels.
+Use issue titles to describe the work itself. Do not prefix titles with roadmap codes such as `[P6]` or `[E4]`; sequencing belongs in the roadmap Milestone, Priority field, and native dependencies.
