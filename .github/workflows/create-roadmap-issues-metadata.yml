@@ -1,0 +1,14 @@
+name: Apply roadmap issue metadata
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Issue numbers are filled after issue creation."
