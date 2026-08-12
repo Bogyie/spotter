@@ -23,7 +23,7 @@ Spotter asks a more specific question than “is the agent wrong?”
 
 > **Can we detect a bad assumption, loop, scope drift, or missing validation while the agent is still working, and intervene before the mistake becomes expensive?**
 
-The repository is already beyond a scaffold. The current prototype implements Hook-based trajectory collection, deterministic gates, crash-safe journals, Git snapshots, fork/replay, a shadow reviewer, claim/evidence state, labels/metrics, and counterfactual experiment machinery.
+The repository is already beyond a scaffold. The current prototype implements Hook-based trajectory collection, deterministic gates, crash-safe journals, Git snapshots, fork/replay, a shadow reviewer, claim/evidence state, evaluation labels/metrics, and counterfactual experiment machinery.
 
 The current prototype and target product architecture are different:
 
@@ -73,7 +73,7 @@ Legend: ✅ implemented · 🟡 partial/shadow · 🧪 proof required · 🎯 ta
 | Fork / continuation replay | ✅ | Same-prefix continuation machinery |
 | Shadow reviewer | ✅ | Produces `CONTINUE / VERIFY / NUDGE`; no live delivery |
 | Claim/evidence audit ledger | 🟡 | Works where observable outcomes exist |
-| Labels / metrics | ✅ | Coverage-aware evaluation; repository label convention is managed as code |
+| Evaluation labels / metrics | ✅ | Coverage-aware evaluation and precision/FP metrics |
 | Counterfactual experiment harness | ✅ | Control/guidance same-prefix pairs |
 | Standalone `spotterd` runtime | ❌ | Target runtime boundary |
 | App Server primary observation | 🧪 | Shared-server/control PoC first (#78) |
@@ -127,7 +127,7 @@ Harden
 
 Experiments are not a separate parallel roadmap. Each stage has an evidence gate. Implementing a mechanism does not prove the mechanism helps.
 
-See [Roadmap](docs/roadmap.md) for linked issues, dependencies, and exit criteria.
+GitHub Milestones carry stage assignment for issues. See [Roadmap](docs/roadmap.md) for stage meaning, linked issues, dependencies, and exit criteria.
 
 ---
 
@@ -344,18 +344,18 @@ Detailed ownership, rollback, upgrades, uninstall, purge, and reinstall behavior
 
 ---
 
-## Issues and labels
+## Issues and metadata
 
-Issues use a deliberately small, managed label vocabulary:
+Repository issues use GitHub's native structured metadata rather than prefixed label taxonomies:
 
-- `type:*` — what kind of work is this?
-- `priority:*` — how urgently should it be selected?
-- `area:*` — which part of Spotter does it belong to?
-- `status:blocked` — can meaningful progress happen now?
+- **Type** — `Task`, `Bug`, `Feature`, `Architecture`, or `Experiment`;
+- **Priority** — `Urgent`, `High`, `Medium`, or `Low`;
+- **Effort** — `XS` through `XL`, representing change surface, validation burden, and uncertainty;
+- **Area** — the primary product/problem domain;
+- **Milestone** — `Runtime`, `Observe`, `Detect`, `Intervene`, `Recover`, or `Harden` when the issue belongs to the product roadmap;
+- **Dependencies** — native `blocked by` / `blocking` relationships for actual blockers.
 
-The canonical catalog is [`.github/labels.json`](.github/labels.json), synchronized automatically by [`.github/workflows/sync-labels.yml`](.github/workflows/sync-labels.yml). Detailed usage rules live in [Repository Conventions](docs/conventions.md#13-issue-labels-and-triage).
-
-Roadmap stages are not encoded in issue titles or labels.
+Labels are exceptional contributor signals only; currently `good first issue` and `help wanted` remain. Detailed semantics live in [Repository Conventions](docs/conventions.md#13-issue-metadata-and-triage).
 
 ---
 
@@ -368,7 +368,7 @@ Roadmap stages are not encoded in issue titles or labels.
 - **[Lifecycle](docs/lifecycle.md)** — install → setup → run → recover → upgrade → teardown → purge
 - **[Roadmap](docs/roadmap.md)** — named stages, dependencies, and evidence gates
 - **[Research](docs/research.md)** — prior work, borrowed ideas, open hypotheses, and evidence gaps
-- **[Conventions](docs/conventions.md)** — code, issue, label, branch, PR, and documentation conventions
+- **[Conventions](docs/conventions.md)** — code, issue metadata, branch, PR, and documentation conventions
 
 ---
 
