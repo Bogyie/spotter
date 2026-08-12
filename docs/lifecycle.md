@@ -1,6 +1,6 @@
 # Lifecycle and Operations
 
-> **Status:** target design tracked by [#66](https://github.com/Bogyie/spotter/issues/66).  
+> **Status:** target design tracked by [#66](https://github.com/spotter-agent/spotter/issues/66).
 > The current prototype is still hook/plugin-centered. Commands such as Homebrew installation, managed `spotterd`, and full App Server integration described here are the **intended product lifecycle**, not current shipping behavior.
 
 ---
@@ -54,7 +54,7 @@ The most important lifecycle constraint is this:
 
 > **If full Codex mode requires an external App Server, that server must be available before ordinary `codex` chooses its App Server target.**
 
-That can conflict with a completely lazy “wake Spotter on the first Hook” design. P0 must determine the canonical startup strategy before the service lifecycle is finalized.
+That can conflict with a completely lazy “wake Spotter on the first Hook” design. The Runtime App Server gate (#78) must determine the canonical startup strategy before the service lifecycle is finalized.
 
 ---
 
@@ -396,7 +396,7 @@ Do **not** plan teardown as “restore the entire old file”. The user may legi
 
 ## 4.5 APPLY
 
-The exact changes depend on the P0-selected App Server strategy. Conceptually:
+The exact changes depend on the App Server strategy selected by the Runtime gate. Conceptually:
 
 1. register/prepare the Spotter runtime service if managed mode requires it;
 2. ensure the external App Server path or attach strategy;
@@ -577,7 +577,7 @@ The requirement is mechanism-independent:
 
 > **In managed mode, whatever runtime is required for full observation/control must be ready before ordinary `codex` chooses its App Server target.**
 
-If P0 confirms that an external App Server must already exist, a likely default is a login-scoped user service:
+If the Runtime gate confirms that an external App Server must already exist, a likely default is a login-scoped user service:
 
 ```text
 user login

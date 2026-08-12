@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status:** this document describes both the current hook-based prototype and the target architecture tracked in [#66](https://github.com/Bogyie/spotter/issues/66).  
+> **Status:** this document describes both the current hook-based prototype and the target architecture tracked in [#66](https://github.com/spotter-agent/spotter/issues/66).
 > `spotterd`, App Server primary observation, and live `turn/steer` delivery are **target behavior**, not current shipping behavior.
 
 ---
@@ -69,7 +69,7 @@ Six decisions define the design:
 | Disconnect / crash behavior | [11. Failure and degraded mode](#11-failure-and-degraded-mode) |
 | Runtime files/sockets/resources | [12. Runtime resources](#12-runtime-resources) |
 | Agent adapter interface | [14. Agent adapter contract](#14-agent-adapter-contract) |
-| First architecture PoC | [15. P0 App Server lifecycle / attach PoC](#15-p0-app-server-lifecycle--attach-poc) |
+| Runtime architecture gate | [15. Runtime gate: App Server lifecycle / attach PoC](#15-runtime-gate-app-server-lifecycle--attach-poc) |
 
 ---
 
@@ -238,7 +238,7 @@ Codex TUI attaches to external App Server
 
 Important constraint: plain `codex` can choose an embedded App Server when a reusable external daemon is unavailable. Starting Spotter only at the first `PreToolUse` can therefore be too late for full observation/control.
 
-That is why P0 comes before the daemon migration.
+That is why the Runtime App Server gate (#78) comes before the daemon migration.
 
 ## 4.2 Normal observation event
 
@@ -849,7 +849,7 @@ When a capability is missing, Spotter should hide/disable the feature or report 
 
 ---
 
-# 15. P0 App Server lifecycle / attach PoC
+# 15. Runtime gate: App Server lifecycle / attach PoC
 
 The target architecture is gated by this experiment.
 
