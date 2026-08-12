@@ -23,7 +23,9 @@ Recover
 Harden
 ```
 
-These are not release versions and they are not strict single-threaded sprints. Work can overlap when dependencies allow. The names answer a more useful question than `P4` or `E2`: **what capability are we trying to make trustworthy next?**
+GitHub Milestones are the source of truth for **which stage owns an issue's completion**. This document owns the meaning and evidence gate of each stage.
+
+The stages are not release versions and they are not strict single-threaded sprints. Work can overlap when dependencies allow. The names answer a more useful question than `P4` or `E2`: **what capability are we trying to make trustworthy next?**
 
 The current blocker is [#78](https://github.com/spotter-agent/spotter/issues/78): prove that ordinary Codex and Spotter can share the same external App Server, observe the same thread/turn, and steer the real active turn.
 
@@ -329,7 +331,7 @@ Once enough of the product exists, run the real-session configuration comparison
 
 # Cross-cutting evidence infrastructure
 
-Some work supports several stages rather than belonging to one stage.
+Some work supports several stages rather than belonging to one stage. Its Milestone indicates the stage by which its current completion gate is needed, not the only area it benefits.
 
 ## Mechanically scored tasks
 
@@ -345,18 +347,17 @@ Some work supports several stages rather than belonging to one stage.
 
 ---
 
-# Priority and issue selection
+# Issue selection
 
-Roadmap stages describe **dependency and product maturity**. Issue priority is a separate, shorter-lived triage decision.
+Roadmap stage, work urgency, size, and problem domain are deliberately separate dimensions. Use GitHub's native metadata rather than encoding them in labels:
 
-Use the labels defined in [Repository Conventions](conventions.md):
+- **Milestone** — the roadmap stage that owns the issue's completion/evidence gate;
+- **Priority** — `Urgent`, `High`, `Medium`, or `Low` for current sequencing pressure;
+- **Effort** — `XS` through `XL` for change surface, validation difficulty, and uncertainty, not elapsed-time prediction;
+- **Area** — the stable primary product/problem domain;
+- **Dependencies** — actual `blocked by` / `blocking` relationships.
 
-- `priority:blocker` — prevents the current stage from advancing;
-- `priority:high` — current/immediately-next critical path or parallel evidence needed soon;
-- `priority:normal` — planned work without immediate sequencing pressure;
-- `priority:low` — distant-stage, opportunistic, or external/community work.
-
-There should be very few blockers. If half the backlog is `high`, the label has stopped carrying information.
+Keep `Urgent` rare. If most open work is `High`, priority has stopped helping choose the next issue. A dependency should mean the downstream issue cannot meaningfully complete without the blocker, not merely that the issues are related.
 
 ---
 
