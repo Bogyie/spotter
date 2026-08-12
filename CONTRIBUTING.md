@@ -10,7 +10,7 @@ Use the repository docs to avoid solving the wrong layer of the problem:
 - [`docs/architecture.md`](docs/architecture.md) — runtime boundaries and component contracts
 - [`docs/lifecycle.md`](docs/lifecycle.md) — install/setup/update/remove behavior
 - [`docs/roadmap.md`](docs/roadmap.md) — named roadmap stages and evidence gates
-- [`docs/conventions.md`](docs/conventions.md) — code, issue, label, branch, commit, test, and documentation conventions
+- [`docs/conventions.md`](docs/conventions.md) — code, issue metadata, branch, commit, test, and documentation conventions
 
 For agent-assisted work, also read [`AGENTS.md`](AGENTS.md).
 
@@ -38,21 +38,28 @@ A dedicated issue is optional unless the documentation change represents a new p
 
 ## Issue triage
 
-Purpose-specific issue forms automatically add the matching `type:*` label. During triage, maintainers add:
+Spotter uses GitHub's native issue metadata instead of label prefixes.
 
-- exactly one `priority:*`;
-- usually one primary `area:*`;
-- `status:blocked` only when meaningful work cannot proceed.
+For maintained open issues, triage with:
 
-Do not encode roadmap stage numbers in issue titles or labels. The roadmap is intentionally named:
+- **Type** — `Bug`, `Feature`, `Architecture`, `Experiment`, or `Task`;
+- **Priority** — `Urgent`, `High`, `Medium`, or `Low`;
+- **Effort** — `XS`, `S`, `M`, `L`, or `XL`;
+- **Area** — one primary product/problem domain;
+- **Milestone** — the roadmap stage that owns the issue's completion gate, when applicable;
+- **Dependencies** — GitHub `blocked by` / `blocking` relationships only for genuine blockers.
+
+Documentation, maintenance, tooling, packaging, and community chores normally use `Task`. Issue forms shape the requested information but do not recreate type/priority/area labels.
+
+The roadmap is intentionally named:
 
 ```text
 Runtime → Observe → Detect → Intervene → Recover → Harden
 ```
 
-The canonical label catalog is [`.github/labels.json`](.github/labels.json) and is synchronized by [`.github/workflows/sync-labels.yml`](.github/workflows/sync-labels.yml). Add or remove repository labels through that catalog rather than creating ad-hoc labels in the GitHub UI.
+Labels are exceptional rather than a second metadata system. Keep `good first issue` and `help wanted` for contributor discovery; add another label only when native fields, milestone, dependencies, or issue state cannot express a recurring useful distinction.
 
-Detailed rules and priority semantics are in [`docs/conventions.md`](docs/conventions.md#13-issue-labels-and-triage).
+Detailed semantics are in [`docs/conventions.md`](docs/conventions.md#13-issue-metadata-and-triage).
 
 ## Local setup
 
