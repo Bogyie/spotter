@@ -1,6 +1,5 @@
 name: Maintenance / chore
 description: Tooling, CI, dependency, cleanup, packaging, or repository maintenance.
-labels: ["type:maintenance"]
 body:
   - type: textarea
     id: task
