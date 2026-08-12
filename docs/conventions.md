@@ -17,6 +17,8 @@ The goal is consistency where consistency saves review time, not ceremony for it
 | Docs | English; current state and target design must be distinguishable |
 | Architecture | Agent transport behind adapters; semantic review async; deterministic gates bounded |
 | Persisted state | Version contracts; migrate or refuse explicitly |
+| Issues | One `type:*`, one `priority:*`, usually one `area:*`; `status:*` only when informative |
+| Roadmap | Named outcomes: Runtime → Observe → Detect → Intervene → Recover → Harden |
 
 ---
 
@@ -198,7 +200,7 @@ Document ownership:
 - `docs/concept.md` — problem, principles, intervention semantics
 - `docs/architecture.md` — component and runtime contracts
 - `docs/lifecycle.md` — install/setup/runtime/update/remove contracts
-- `docs/roadmap.md` — dependency order and exit criteria
+- `docs/roadmap.md` — named stages, dependency order, and evidence gates
 - `docs/research.md` — prior work, hypotheses, evidence
 
 Avoid duplicating a detailed contract across documents. Link to the owning document.
@@ -266,7 +268,89 @@ Use the closest purpose-specific template and remove irrelevant optional section
 
 Architecture-changing PRs should identify changed ownership/boundaries. Research PRs should identify the evidence generated. Documentation PRs should state whether they describe current behavior or target direction.
 
-## 13. Issue conventions
+## 13. Issue labels and triage
+
+Labels exist to make a query or triage decision easier. Do not add a label merely because a fact can be encoded.
+
+The canonical catalog is `.github/labels.json`. `.github/workflows/sync-labels.yml` reconciles the repository to that catalog, including removing labels that are no longer part of the convention.
+
+### Type
+
+Every maintained open issue should have exactly one `type:*` label.
+
+| Label | Use |
+| --- | --- |
+| `type:bug` | incorrect behavior, regression, broken contract |
+| `type:feature` | new user/developer-facing capability |
+| `type:architecture` | ownership, lifecycle, interface, state, or runtime-boundary decision |
+| `type:experiment` | research/evaluation whose primary output is evidence |
+| `type:maintenance` | tooling, packaging, cleanup, dependencies, repository operations |
+| `type:docs` | documentation-only change |
+
+Issue forms apply the matching type automatically. A blank issue should receive a type during triage.
+
+### Priority
+
+Every maintained open issue should have exactly one `priority:*` label after triage.
+
+| Label | Meaning |
+| --- | --- |
+| `priority:blocker` | the current roadmap stage cannot advance until this is resolved |
+| `priority:high` | current/immediately-next critical path or parallel evidence needed soon |
+| `priority:normal` | planned work with no immediate sequencing pressure |
+| `priority:low` | useful but non-critical, distant-stage, opportunistic, or external/community work |
+
+Priority is intentionally **not** a roadmap phase. It can change as dependencies change.
+
+Keep `blocker` rare. Do not use `high` as the default value; if most open issues are high priority, the label no longer helps choose work.
+
+### Area
+
+Use one primary `area:*` label in most cases. Add a second only when the issue genuinely spans two independently useful filters.
+
+| Label | Scope |
+| --- | --- |
+| `area:runtime` | `spotterd`, App Server integration, adapters, IPC, live runtime state |
+| `area:observation` | event ingestion, Trace IR, audit evidence, observability |
+| `area:detection` | signals, reviewer judgment, detection policy/quality |
+| `area:intervention` | VERIFY/NUDGE/BLOCK delivery, supervision UX/provenance |
+| `area:recovery` | interrupt, restart, snapshots, reversibility, side effects |
+| `area:evaluation` | task sets, experiments, replay measurement, metrics, statistics, A/B |
+| `area:operations` | install/setup/update, schemas, retention, cleanup, diagnostics |
+| `area:community` | OSS programs, showcases, ecosystem listings, outreach |
+
+Roadmap stages are not encoded as labels. `Runtime → Observe → Detect → Intervene → Recover → Harden` lives in `docs/roadmap.md`; area labels are stable code/product filters.
+
+### Status
+
+`status:blocked` is the only custom status label.
+
+Use it only when **meaningful progress on the issue cannot continue** until a dependency, decision, capability, or external condition changes. Do not use it merely because another issue is related.
+
+Open/closed, duplicate, and not-planned state should use GitHub's native issue state/close reason instead of labels such as `duplicate`, `wontfix`, or `deferred`.
+
+### Contributor labels
+
+Keep the GitHub-standard labels:
+
+- `good first issue` — small and well-bounded for a new contributor;
+- `help wanted` — maintainers explicitly welcome outside help.
+
+These are opt-in signals, not required dimensions.
+
+### Labels intentionally not used
+
+Do not recreate:
+
+- numbered `tier-*` priority schemes;
+- temporary `batch-*` implementation groups;
+- provider labels such as `codex` while nearly the whole project targets that provider;
+- agent/tool ownership labels such as `Amazon Q development agent`;
+- `duplicate`, `invalid`, `wontfix`, or `deferred` when GitHub native state already carries the information.
+
+If a future category becomes useful, add it because it enables a recurring query or decision—not because one issue happens to need a description.
+
+## 14. Issue conventions
 
 Issues should be decision-ready rather than exhaustive.
 
@@ -280,3 +364,5 @@ acceptance or evidence criteria
 ```
 
 Use sub-issues or follow-up issues rather than growing one implementation ticket into an unbounded backlog. Umbrella issues are appropriate for architecture/direction when they explicitly delegate concrete work.
+
+Use issue titles to describe the work itself. Do not prefix titles with roadmap codes such as `[P6]` or `[E4]`; sequencing belongs in the roadmap and priority labels.
