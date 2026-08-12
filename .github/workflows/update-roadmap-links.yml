@@ -1,0 +1,50 @@
+name: Update active roadmap references
+
+on:
+  push:
+    paths:
+      - .github/workflows/update-roadmap-links.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace closed umbrella references
+        shell: python
+        run: |
+          from pathlib import Path
+
+          replacements = {
+              "docs/architecture.md": (
+                  "> **Status:** this document describes both the current hook-based prototype and the target architecture tracked in [#66](https://github.com/spotter-agent/spotter/issues/66).",
+                  "> **Status:** this document describes both the current hook-based prototype and the target architecture. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.",
+              ),
+              "docs/lifecycle.md": (
+                  "> **Status:** target design tracked by [#66](https://github.com/spotter-agent/spotter/issues/66).",
+                  "> **Status:** target design. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.",
+              ),
+              "docs/research.md": (
+                  "The standalone-runtime direction in [#66](https://github.com/spotter-agent/spotter/issues/66) changes the observation/control substrate used to test that claim. It does not count as evidence for the claim by itself.",
+                  "The standalone-runtime direction described in [Architecture](architecture.md) and tracked through the [Roadmap](roadmap.md) changes the observation/control substrate used to test that claim. It does not count as evidence for the claim by itself.",
+              ),
+          }
+
+          for name, (old, new) in replacements.items():
+              path = Path(name)
+              text = path.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected text not found in {name}")
+              path.write_text(text.replace(old, new, 1))
+      - name: Commit changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/architecture.md docs/lifecycle.md docs/research.md
+          git commit -m "docs: point architecture tracking to active roadmap"
+          git push
