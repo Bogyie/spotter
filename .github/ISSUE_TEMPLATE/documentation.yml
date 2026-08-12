@@ -1,6 +1,5 @@
 name: Documentation
 description: Improve or correct repository documentation without changing product behavior.
-labels: ["type:docs"]
 body:
   - type: textarea
     id: problem
