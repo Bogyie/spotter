@@ -1,0 +1,92 @@
+name: Sync labels
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/labels.json
+      - .github/workflows/sync-labels.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconcile labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          api = "https://api.github.com"
+          repo = os.environ["GH_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          desired = {item["name"]: item for item in json.loads(Path(".github/labels.json").read_text())}
+
+          def request(method, path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  api + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      body = response.read()
+                      return json.loads(body) if body else None
+              except urllib.error.HTTPError as exc:
+                  print(exc.read().decode(), flush=True)
+                  raise
+
+          current = {}
+          page = 1
+          while True:
+              items = request("GET", f"/repos/{repo}/labels?per_page=100&page={page}")
+              if not items:
+                  break
+              current.update({item["name"]: item for item in items})
+              if len(items) < 100:
+                  break
+              page += 1
+
+          for name, spec in desired.items():
+              payload = {
+                  "new_name": name,
+                  "color": spec["color"],
+                  "description": spec.get("description") or "",
+              }
+              if name in current:
+                  encoded = urllib.parse.quote(name, safe="")
+                  request("PATCH", f"/repos/{repo}/labels/{encoded}", payload)
+                  print(f"updated {name}")
+              else:
+                  request("POST", f"/repos/{repo}/labels", {
+                      "name": name,
+                      "color": spec["color"],
+                      "description": spec.get("description") or "",
+                  })
+                  print(f"created {name}")
+
+          for name in sorted(set(current) - set(desired)):
+              encoded = urllib.parse.quote(name, safe="")
+              request("DELETE", f"/repos/{repo}/labels/{encoded}")
+              print(f"deleted {name}")
+          PY
