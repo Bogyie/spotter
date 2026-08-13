@@ -26,12 +26,19 @@ from spotter.budget import (
 from spotter.codex import CodexAdapter
 from spotter.config import ConfigurationError, MainAgentConfig, ReviewerConfig, SpotterConfig
 from spotter.core import SpotterRuntime
-from spotter.daemon import DaemonStatus, ManualServiceManager, RuntimeHealth, ServiceManager
+from spotter.daemon import (
+    DaemonStatus,
+    ManagedServiceManager,
+    ManualServiceManager,
+    RuntimeHealth,
+    ServiceManager,
+)
 from spotter.doctor import FAIL, OK, WARN, worst
 from spotter.doctor import run as run_doctor
 from spotter.experiment import list_forks, results_path, run_experiment, summarize
 from spotter.gates import Gate
 from spotter.hook import journal_path, run_hook
+from spotter.integration import IntegrationError, IntegrationManager, IntegrationManifest
 from spotter.labels import LabelError, add_label, valid_session
 from spotter.metrics import Tally, merge, tally_session
 from spotter.paths import secure_dir, spotter_home
@@ -68,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
             "status",
             "doctor",
             "daemon",
+            "setup",
+            "teardown",
         ],
         default="observe",
         help=(
@@ -80,14 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
             "metrics: gate FP rate, reviewer precision and observability ceiling from labels; "
             "status: what Spotter is storing, and whether it is actually running; "
             "doctor: verify supervision end to end (non-zero exit when broken); "
-            "daemon: manually start, stop, restart, or inspect spotterd"
+            "daemon: manually start, stop, restart, or inspect spotterd; "
+            "setup/teardown: manage the owned Codex integration"
         ),
     )
     parser.add_argument(
-        "daemon_action",
+        "target",
         nargs="?",
-        choices=["start", "stop", "restart", "status"],
-        help="daemon lifecycle action",
+        choices=["start", "stop", "restart", "status", "codex"],
+        help="daemon lifecycle action or integration target",
     )
     parser.add_argument("--config", type=Path, help="path to Spotter TOML config")
     parser.add_argument("--session", help="session id (fork; analyze filters to it)")
@@ -142,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="experiment: keep forked worktrees (rollouts are always retained)",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="setup: inspect and print the mutation plan"
+    )
+    parser.add_argument(
+        "--portable",
+        action="store_true",
+        help="setup: start spotterd without registering a login service",
+    )
     return parser
 
 
@@ -167,11 +185,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _hook_main(None, args.config)
 
     if args.command == "daemon":
-        if args.daemon_action is None:
+        if args.target is None or args.target == "codex":
             parser.error("daemon requires start, stop, restart, or status")
-        return _daemon_main(args.daemon_action)
-    if args.daemon_action is not None:
-        parser.error("daemon lifecycle actions require the daemon command")
+        return _daemon_main(args.target)
+    if args.command in {"setup", "teardown"}:
+        if args.target != "codex":
+            parser.error(f"{args.command} requires the codex target")
+        if args.command == "teardown" and (args.dry_run or args.portable):
+            parser.error("--dry-run and --portable are only supported by setup")
+        return _integration_main(
+            args.command,
+            config_path=args.config,
+            portable=args.portable,
+            dry_run=args.dry_run,
+        )
+    if args.target is not None:
+        parser.error("the second positional argument requires daemon, setup, or teardown")
+    if args.dry_run or args.portable:
+        parser.error("--dry-run and --portable require setup")
 
     config = _load_config(parser, args.config)
     # One boundary check for every command that names a session: sanitizing
@@ -542,7 +573,19 @@ def _doctor_main(config_path: Path | None) -> int:
 
 
 def _daemon_main(action: str, manager: ServiceManager | None = None) -> int:
-    service = manager or ManualServiceManager()
+    if manager is not None:
+        service = manager
+    else:
+        try:
+            manifest = IntegrationManifest.load(spotter_home() / "integrations" / "codex.json")
+        except IntegrationError as error:
+            print(f"spotterd: unavailable ({error})", file=sys.stderr)
+            return 1
+        service = (
+            ManagedServiceManager()
+            if manifest is not None and manifest.runtime_mode == "managed"
+            else ManualServiceManager()
+        )
 
     async def run() -> DaemonStatus:
         operations = {
@@ -566,6 +609,36 @@ def _daemon_main(action: str, manager: ServiceManager | None = None) -> int:
     if action == "stop":
         return 0 if status.health == RuntimeHealth.UNAVAILABLE else 1
     return 0 if status.health == RuntimeHealth.HEALTHY else 1
+
+
+def _integration_main(
+    action: str,
+    *,
+    config_path: Path | None,
+    portable: bool,
+    dry_run: bool,
+    manager: IntegrationManager | None = None,
+) -> int:
+    """Install or remove the owned Codex integration transactionally."""
+    try:
+        integration = manager or IntegrationManager(portable=portable, config_path=config_path)
+        if action == "setup":
+            plan = integration.plan()
+            for line in plan.lines():
+                print(line)
+            if dry_run:
+                print("dry-run: no changes made")
+                return 0
+            manifest = integration.setup()
+            print(f"Codex integration: {manifest.state} ({integration.manifest_path})")
+            print("App Server endpoint: pending runtime integration (#85/#87)")
+            return 0
+        removed = integration.teardown()
+        print("Codex integration removed" if removed else "Codex integration not configured")
+        return 0
+    except IntegrationError as error:
+        print(f"Codex integration failed: {error}", file=sys.stderr)
+        return 1
 
 
 def _status_main() -> int:
