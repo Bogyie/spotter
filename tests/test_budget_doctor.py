@@ -8,7 +8,17 @@ import pytest
 from spotter.budget import LedgerCorrupt, cancel, charge, exhausted, read, reserve, settle
 from spotter.cli import main
 from spotter.config import GatesConfig, MainAgentConfig, ReviewerConfig, SpotterConfig
-from spotter.doctor import FAIL, OK, WARN, check_freshness, check_roundtrip, run, worst
+from spotter.doctor import (
+    FAIL,
+    INFO,
+    OK,
+    WARN,
+    check_freshness,
+    check_registration,
+    check_roundtrip,
+    run,
+    worst,
+)
 from spotter.hook import journal_path, run_hook
 from spotter.snapshot import StepJournal
 from spotter.trace import TraceEvent
@@ -17,6 +27,7 @@ from spotter.trace import TraceEvent
 @pytest.fixture(autouse=True)
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("SPOTTER_HOME", str(tmp_path / "spotter"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     return tmp_path / "spotter"
 
 
@@ -120,8 +131,8 @@ def test_roundtrip_leaves_no_probe_journal(home: Path) -> None:
 
 
 def test_freshness_reports_never_observed() -> None:
-    assert check_freshness().status == WARN
-    assert "has ever been recorded" in check_freshness().detail
+    assert check_freshness().status == INFO
+    assert "recorded yet" in check_freshness().detail
 
 
 def test_freshness_warns_when_stale(home: Path) -> None:
@@ -159,10 +170,28 @@ def test_doctor_run_covers_every_layer() -> None:
     assert any(name.endswith("hook") or name.endswith("config") for name in names)
 
 
+def test_unregistered_optional_runtime_is_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex = tmp_path / "codex"
+    claude = tmp_path / "claude"
+    codex.mkdir()
+    claude.mkdir()
+    (codex / "hooks.json").write_text('{"hooks":{"PreToolUse":[{"command":"spotter hook"}]}}')
+    (claude / "settings.json").write_text("{}")
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+
+    checks = check_registration()
+
+    assert worst(checks) == OK
+    assert next(check for check in checks if check.name == "claude hook").status == INFO
+
+
 def test_status_reports_spend(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     StepJournal(journal_path({"session_id": "s"})).record(TraceEvent("x"))
     charge("s", tokens=1234)
-    assert main(["status"]) == 0
+    assert main(["status"]) == 1
     out = capsys.readouterr().out
     assert "reviews today: 1" in out and "1234" in out
     assert json.loads((home / "review-spend.json").read_text())["sessions"]["s"]["tokens"] == 1234
@@ -206,7 +235,7 @@ def test_status_survives_a_corrupt_ledger(home: Path, capsys: pytest.CaptureFixt
     it exists to diagnose."""
     StepJournal(journal_path({"session_id": "s"})).record(TraceEvent("x"))
     (home / "review-spend.json").write_text("{torn")
-    assert main(["status"]) == 0
+    assert main(["status"]) == 2
     assert "spend ledger unreadable" in capsys.readouterr().out
 
 

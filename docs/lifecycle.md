@@ -1,7 +1,7 @@
 # Lifecycle and Operations
 
 > **Status:** target design with an implemented transactional Codex setup slice. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.
-> `spotter setup|teardown codex`, versioned ownership manifests, managed `launchd`/`systemd --user` registration, portable startup, and legacy Hook/plugin migration exist. Homebrew installation, App Server event ingestion, runtime-aware diagnostics, and transparent plain-`codex` launch remain target behavior.
+> `spotter setup|teardown codex`, versioned ownership manifests, managed `launchd`/`systemd --user` registration, portable startup, legacy Hook/plugin migration, and runtime-aware diagnostics exist. Homebrew installation, App Server event ingestion, and transparent plain-`codex` launch remain target behavior.
 
 ---
 
@@ -819,6 +819,13 @@ Do not treat experiment machinery as evidence of positive intervention advantage
 
 Designed for a quick operational answer.
 
+The implemented command reports manifest/Hook ownership, daemon RPC, observation, live control,
+enforcement consequences, storage, reviewer errors, and spend-ledger health. Exit `0` is healthy,
+`1` is degraded/warn, and `2` is broken. Expected unavailable surfaces are informational and do not
+affect the verdict; once a configured surface becomes unavailable it warns or fails according to
+its consequence. Until #85 supplies live identity state, active/dormant thread counts remain
+explicitly unknown rather than inferred from Hook sessions.
+
 Example:
 
 ```text
@@ -842,6 +849,12 @@ Sessions
 ## 9.2 `spotter doctor`
 
 Doctor should be diagnostic and synthetic, not just configuration inspection.
+
+The implemented doctor preserves the synthetic Hook round-trip and storage/ledger checks, validates
+the integration manifest against the exact owned Hook and legacy plugin state, checks daemon IPC,
+and probes a configured App Server endpoint. Expected unimplemented capabilities are informational,
+configured-but-unavailable capabilities warn, and broken owned integration, daemon, storage, or
+ledger contracts fail.
 
 Checks:
 
@@ -1332,8 +1345,8 @@ The target lifecycle is not complete until all of these work end-to-end:
 - [x] `spotter setup codex` is idempotent;
 - [x] interrupted setup can heal forward when setup is re-run (pre-manifest teardown cannot infer ownership);
 - [ ] ordinary `codex` requires no manual Spotter/App Server startup in managed mode;
-- [ ] `status` distinguishes daemon, observation, control, enforcement, storage health;
-- [ ] `doctor` performs a real synthetic round-trip;
+- [x] `status` distinguishes daemon, observation, control, enforcement, storage health;
+- [x] `doctor` performs a real synthetic round-trip;
 - [ ] multiple concurrent threads/sessions remain isolated;
 - [ ] daemon crash recovers without corrupting journal/live state;
 - [ ] Codex upgrade degrades by capability rather than silently breaking;
