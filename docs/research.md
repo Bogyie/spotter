@@ -26,6 +26,9 @@ The standalone-runtime direction described in [Architecture](architecture.md) an
 | **AgentProcessBench** | neutral exploration ≠ error | candidates are not verdicts; conservative reviewer | design principle |
 | **HarnessFix** | normalize traces; diagnose harness | Trace IR / adapter boundary | partial implementation / target expansion |
 | **Refute-or-Promote** | falsification beats consensus | evidence-first VERIFY / empirical probes | design principle |
+| **Shepherd** | live meta-agent supervision over execution traces | supervisor behavior / steer-revert precedent | behavior exists, but execution is framework-owned rather than native Codex attachment |
+| **NeMo Relay** | interception/runtime substrate around existing agents | middleware, lifecycle, observability, integration patterns | strong implementation reference; no autonomous Navigator behavior |
+| **OpenClaw Codex supervision** | App Server-backed Codex visibility and control | native session observation, steer, interrupt | strong App Server reference; supervision serves OpenClaw integration rather than an independent pair agent |
 
 ---
 
@@ -494,6 +497,256 @@ Better:
 
 ---
 
+# 11. Adjacent systems — implementation precedents, not drop-in dependencies
+
+As of 2026-08-13, three public systems are particularly useful for locating Spotter's remaining design space: Shepherd, NVIDIA NeMo Relay, and OpenClaw's Codex supervision/runtime integration.
+
+They substantially reduce uncertainty about whether the individual building blocks are possible. None of them, however, is a drop-in implementation of Spotter's intended product behavior.
+
+| System | What is already solved | What is still missing relative to Spotter |
+| --- | --- | --- |
+| **Shepherd** | live meta-agent observation and runtime `steer/revert` over agent execution traces | transparent attachment to a user's existing native Codex session; App Server/IPC integration; zero-workflow-change deployment |
+| **NeMo Relay** | interception/runtime substrate, middleware, lifecycle events, observability, host integration patterns | an autonomous pair/Navigator model that continuously reasons about Main; App Server-native low-latency steering architecture |
+| **OpenClaw Codex supervision** | Codex App Server connection, thread/session discovery, native runtime integration, `steer` and `interrupt` controls | a standalone invisible supervisor; continuous second-model semantic reasoning; speculative supervision designed to stay off Main's critical path |
+
+The useful conclusion is not that Spotter can import one of these projects and be finished. It is that **the problem, runtime mechanisms, and native control primitives have each been validated independently**.
+
+## 11.1 Shepherd — supervisor behavior without native attachment
+
+Repositories:
+
+- https://github.com/shepherd-agents/shepherd
+- https://github.com/shepherd-agents/shepherd-experiments
+
+Shepherd is a runtime substrate for inspection, reversibility, and supervision. Its framework owns the execution: tasks run inside Shepherd-managed workspaces and produce retained outputs that can later be selected, applied, or discarded.
+
+Its live-intervention experiment is especially relevant. A Sonnet meta-agent supervises parallel Haiku workers through an effect stream and can intervene with `steer/revert` when it detects coordination failure.
+
+This validates much of Spotter's original behavioral intuition:
+
+```text
+worker execution
+      ↓
+effect / trajectory stream
+      ↓
+meta-agent supervisor
+      ↓
+selective intervention
+```
+
+The boundary is product/runtime ownership. Shepherd is **framework-first**: the user runs an agent task through Shepherd. Spotter instead wants to attach to the coding agent the user already runs and leave that workflow unchanged.
+
+Target Spotter experience:
+
+```text
+before Spotter installation
+$ codex
+
+
+after Spotter installation
+$ codex
+```
+
+The current public Shepherd repository does not expose a native Codex App Server attachment path that turns an already-normal Codex experience into a transparently supervised one.
+
+### What to borrow from Shepherd
+
+- live-supervisor behavior and intervention taxonomy;
+- effect-stream-driven supervision rather than final-output-only review;
+- evaluation design for managed vs unmanaged trajectories;
+- steer/revert semantics and intervention-budget ideas;
+- reversible execution and counterfactual experiment concepts.
+
+### What not to inherit blindly
+
+- framework ownership of the user's execution flow;
+- requirement that the workload be expressed as a Shepherd task;
+- sandbox/workspace model as a prerequisite for basic Spotter supervision.
+
+Shepherd is therefore strongest as a **behavioral and experimental precedent**, not as Spotter's integration substrate.
+
+## 11.2 NVIDIA NeMo Relay — runtime/interception substrate without Navigator behavior
+
+Repository:
+
+https://github.com/NVIDIA/NeMo-Relay
+
+NeMo Relay describes itself as a shared runtime for visibility and control over existing agent runs. It already implements many pieces that Spotter would otherwise have to discover through infrastructure work:
+
+- execution scopes and lifecycle events;
+- LLM/tool middleware boundaries;
+- blocking, sanitization, transformation, routing, retry, and replacement hooks;
+- event subscribers and normalized trajectory/observability formats;
+- local-agent wrappers and persistent host integrations;
+- Codex/Claude Code/Hermes integration patterns;
+- installation, diagnostics, trust, and runtime lifecycle concerns.
+
+This is the closest implementation reference for the generic **interceptor/runtime plumbing** around Spotter.
+
+However, Relay intentionally does not define the higher-level intelligence that consumes those boundaries. Its role is closer to:
+
+```text
+"Here is a common place to observe, intercept, transform, and export agent activity."
+```
+
+Spotter's problem is:
+
+```text
+"What should an independent second model notice, predict, and say to Main — and when should it stay silent?"
+```
+
+There is also an important Codex-specific difference. Relay's public Codex integration is currently centered on host hooks and provider/gateway configuration. Its own support matrix marks optimization as partial and host-dependent. That is useful for observability and policy, but it is not the App Server-native control plane Spotter wants for low-latency `turn/steer` / `turn/interrupt` behavior.
+
+### What to borrow from NeMo Relay
+
+- interceptor and middleware boundary design;
+- normalized event/trajectory representations;
+- host integration and transparent-wrapper patterns;
+- lifecycle, health, diagnostics, rollback, and trust-management patterns;
+- observability/export conventions such as ATOF/ATIF/OTel;
+- lessons from supporting multiple agent harnesses behind adapters.
+
+### Why Relay should not be a required Spotter dependency yet
+
+Using Relay directly would add another compatibility and lifecycle boundary without currently removing the hardest Spotter work: App Server ownership, live Navigator state, speculative semantic review, intervention relevance, and low-latency steering.
+
+It can also change host/provider configuration as part of its Codex integration. Spotter's stronger product requirement is that installation should make native Codex *feel unchanged*, including its normal interaction model and latency profile.
+
+For now, treat Relay as a **reference implementation and optional interoperability target**, not Spotter's architecture.
+
+## 11.3 OpenClaw Codex supervision — App Server control without an independent pair supervisor
+
+Repository and relevant implementation references:
+
+- https://github.com/openclaw/openclaw
+- https://github.com/openclaw/openclaw/blob/main/docs/plugins/codex-harness-runtime.md
+- https://github.com/openclaw/openclaw/blob/main/extensions/codex/src/supervision-tools.ts
+
+OpenClaw is the strongest public implementation reference for the Codex App Server side of Spotter.
+
+Its Codex harness lets Codex continue to own the native model loop, thread resume, tool continuation, and compaction while OpenClaw builds channel routing, tools, approvals, transcript mirroring, and controls around that boundary.
+
+The supervision implementation already contains primitives equivalent to:
+
+```text
+list sessions
+read session
+send / start / steer
+interrupt
+```
+
+That means the App Server-based observation/control mechanism itself is not speculative. There is real implementation code to study for:
+
+- App Server process and connection management;
+- stdio / Unix / WebSocket endpoint handling;
+- thread discovery and source kinds;
+- active-thread ownership and race conditions;
+- security checks around remote endpoints;
+- `turn/steer` and interrupt semantics;
+- separation between native Codex tools/hooks and adapter-owned tools;
+- failure-closed behavior around uncertain thread ownership.
+
+The difference is purpose. OpenClaw supervision exists to make Codex a richer OpenClaw harness/backend and to expose Codex sessions to OpenClaw control. It requires the OpenClaw system and does not implement a persistent autonomous second model whose sole job is to pair with Main.
+
+Spotter's intended loop remains different:
+
+```text
+                           ┌──────────────────┐
+                           │ Spotter Navigator│
+                           │ independent model│
+                           └───────▲─────┬────┘
+                                   │     │
+                             observe     │ reason ahead
+                                   │     │
+User → native Codex → App Server ──┘     │
+                       ▲                 │
+                       └──── steer ──────┘
+```
+
+OpenClaw should therefore be treated as the **best current implementation reference for Codex App Server integration and control**, not as the product Spotter is trying to build.
+
+## 11.4 What these systems change about Spotter's implementation strategy
+
+The default strategy should be **study and reuse patterns before adopting dependencies**.
+
+| Area | Best reference | Spotter action |
+| --- | --- | --- |
+| supervisor behavior | Shepherd | borrow intervention/evaluation patterns |
+| reversible/counterfactual execution | Shepherd | compare with existing snapshot/fork/replay machinery |
+| generic interception/middleware | NeMo Relay | study boundary and event design |
+| host install/lifecycle/diagnostics | NeMo Relay | copy proven patterns where licensing and architecture permit |
+| normalized trajectory/telemetry | NeMo Relay | evaluate interoperability instead of inventing formats unnecessarily |
+| Codex App Server client | OpenClaw | study connection and request/event handling |
+| thread ownership / races | OpenClaw | incorporate failure modes before productionizing |
+| steer / interrupt control | OpenClaw | study exact control semantics and edge cases |
+| autonomous pair supervision | none of the three | Spotter core |
+| speculative async supervision | none of the three | Spotter core |
+| zero-workflow-change native Codex UX | none of the three as a complete product | Spotter product requirement |
+
+This suggests a deliberately small direct implementation path:
+
+```text
+native Codex
+    ↕
+Codex App Server
+    ↕
+CodexAdapter
+    ↕
+spotterd
+    ├─ trajectory state
+    ├─ Navigator model
+    ├─ speculative lookahead
+    ├─ intervention cache
+    └─ steer / interrupt controller
+```
+
+Do not introduce Shepherd, NeMo Relay, or OpenClaw as a required runtime dependency unless a concrete measured benefit justifies the extra coupling.
+
+## 11.5 Remaining product/technical gap
+
+The public precedents make the remaining Spotter hypothesis narrower and more testable.
+
+Shepherd shows that a live meta-agent can supervise and intervene. NeMo Relay shows that agent execution can be intercepted and normalized without rebuilding the whole agent stack. OpenClaw shows that Codex App Server can be treated as a serious native integration/control surface.
+
+The remaining combination is:
+
+> **Attach transparently to native Codex, keep an independent Navigator reasoning alongside Main, move semantic supervision off Main's critical path, and inject only timely interventions into the active turn.**
+
+The important latency property is not merely “async review.” A reactive pattern still pays the full reviewer cost if inference starts only after the questionable action is proposed:
+
+```text
+Main action
+   ↓
+start supervisor inference
+   ↓
+wait
+   ↓
+allow / steer
+```
+
+The target is **speculative / anticipatory supervision**:
+
+```text
+Main        ─────────────────────────────▶
+
+Navigator      predict / evaluate ───────▶
+                 in parallel
+
+Main reaches likely decision boundary
+                 ↓
+          precomputed judgment
+                 ↓
+            steer if needed
+```
+
+This creates a stronger engineering/research question:
+
+> **Can runtime supervision be moved off the coding agent's critical path through speculative, asynchronous lookahead?**
+
+That is the part Spotter still has to implement and prove.
+
+---
+
 # Synthesis: how the pieces fit together
 
 ```text
@@ -528,6 +781,19 @@ Refute-or-Promote
   falsification before promotion
 ```
 
+Adjacent implementation precedents sharpen the engineering path:
+
+```text
+Shepherd
+  live supervisor behavior / steer-revert precedent
+        +
+NeMo Relay
+  interception, lifecycle, middleware, observability patterns
+        +
+OpenClaw Codex
+  App Server integration / native steer-interrupt patterns
+```
+
 Spotter adds an engineering hypothesis underneath this research synthesis:
 
 ```text
@@ -536,6 +802,8 @@ rich observation/control stream
 long-lived independent state
         +
 selective async semantic review
+        +
+speculative lookahead off Main's critical path
         +
 bounded synchronous enforcement
 ```
@@ -666,6 +934,38 @@ Collect/measure:
 - whether users can tell healthy silence from disconnected silence;
 - whether setup/daemon lifecycle becomes operationally burdensome.
 
+## RQ11 — Speculative supervision and critical-path removal
+
+Can Spotter predict likely near-future decisions/actions early enough to finish semantic evaluation before Main reaches the decision boundary?
+
+Measure:
+
+```text
+prediction horizon
+next-action / next-decision hit rate
+supervision lead time
+supervision lag
+precomputed-decision hit rate
+stale prediction rate
+intervention precision
+added wall-clock latency
+```
+
+Compare at least:
+
+```text
+reactive reviewer
+  inference starts after signal/action
+
+async reviewer
+  inference runs beside Main from current state
+
+speculative supervisor
+  likely future branches are predicted and evaluated ahead of Main
+```
+
+**Decision affected:** whether speculative lookahead is worth its additional token/compute cost and whether it can keep semantic supervision effectively off Main's critical path.
+
 ---
 
 # Evaluation matrix
@@ -686,6 +986,9 @@ D. Spotter + deterministic gate
 
 E. Full Spotter
    gate + steer + stronger interrupt/recovery primitives
+
+F. Speculative Spotter
+   continuous lookahead + precomputed interventions
 ```
 
 Hold the runtime substrate constant where possible when comparing supervision policy, otherwise architecture changes become a confound.
@@ -702,7 +1005,7 @@ Hold the runtime substrate constant where possible when comparing supervision po
 | Observation | event coverage, observable outcome rate, missing goal/constraint rate, disconnect rate |
 | Detection | precision, FP rate, sampled miss rate/recall, abstention/blind spots |
 | Intervention | advantage, harm rate, recovery rate, ignored rate |
-| Timing | detection delay, reviewer latency, delivery latency, stale rate, wasted actions |
+| Timing | detection delay, reviewer latency, delivery latency, supervision lead/lag, precomputed-decision hit rate, stale rate, wasted actions |
 | Recovery | success after nudge/interrupt/restart, useful work retained, external effects unreverted |
 | Operations | Hook latency, reconnect/recovery time, upgrade/migration failure rate |
 
@@ -744,6 +1047,7 @@ RESTART
 5. **No replay/fork noise-floor measurement** supporting causal interpretation.
 6. **No live wrong-nudge/sycophancy evaluation** before injection.
 7. **No full runtime overhead measurement** for the target architecture.
+8. **No speculative-supervision measurement** showing that useful Navigator inference can finish ahead of Main often enough to remove semantic review from the critical path.
 
 These gaps should be treated as first-class roadmap items, not post-launch research cleanup.
 
