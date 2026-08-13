@@ -1,7 +1,7 @@
 # Architecture
 
 > **Status:** this document describes both the current hook-based prototype and the target architecture. Active implementation is tracked by the [Roadmap](roadmap.md) and native GitHub Milestones.
-> The `spotterd` process/control foundation, shared-server PoC, and production App Server transport are implemented. App Server primary Trace IR observation and live supervision delivery remain **target behavior**.
+> The `spotterd` process/control foundation, bounded Hook gate IPC, shared-server PoC, and production App Server transport are implemented. App Server primary Trace IR observation and live supervision delivery remain **target behavior**.
 
 ---
 
@@ -219,7 +219,7 @@ These boundaries are intended to be concrete enough to drive implementation.
 | `SignalEngine` | cheap candidate detection | event + live state | candidate signal | bounded rolling counters/state | no candidate |
 | `ReviewerScheduler` | async model execution, budget, dedupe | candidate + context | `ReviewerJob` | queues, budgets | job fails; Main continues |
 | `InterventionController` | freshness, delivery, escalation | reviewer decision + live turn state | steer/interrupt/no-op | intervention history | stale/discard/degraded |
-| `GateEngine` | deterministic pre-action policy | `PreToolUse` proposal + config | allow/deny | rule config + bounded state | fail-open |
+| `GateEngine` | deterministic pre-action policy | `PreToolUse` proposal + config | allow/deny | rule config + bounded state | local fallback / fail-open |
 | `JournalStore` | durable event history | normalized records | append/read | disk | write telemetry; never invent success |
 | `SnapshotManager` | Git checkpoints and detached restore | repo/worktree state | snapshot ref/worktree | Git resources | snapshot failure does not break Main |
 | `IntegrationManager` | setup/teardown/migration | agent config + runtime environment | integration mutations + manifest | integration manifest | transactional rollback |
@@ -330,6 +330,14 @@ Hook response
 
 No network/model call belongs on this path.
 
+The implemented bridge sends only normalized command/file proposal data, deterministic gate config,
+and the workspace root over the versioned local socket. It has a 200 ms total request deadline. A
+missing daemon or timeout falls back to the same local deterministic Gate while recording `gate_ipc`
+failure telemetry, so the manual-start lifecycle does not disable existing enforcement. Malformed or
+version-mismatched responses and unsupported proposal shapes fail open. Daemon evaluation time, IPC
+time, and total Hook time are recorded separately so latency percentiles can be computed without putting
+aggregation on the synchronous path.
+
 ## 4.5 Turn completion
 
 ```text
@@ -394,11 +402,10 @@ Those belong in the asynchronous reviewer path.
 
 ### Failure policy
 
-If any of the following occurs:
+If daemon IPC is unavailable or times out, the Hook evaluates the same deterministic Gate locally
+and records the degraded IPC status. If the proposal itself cannot be judged safely, including:
 
 ```text
-spotterd unavailable
-IPC timeout
 unsupported syntax
 unknown workspace
 ```
