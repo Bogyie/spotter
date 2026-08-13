@@ -11,7 +11,8 @@ Start here if you are reading the repository for the first time.
 | What processes/components/state should exist? | [Architecture](architecture.md) | component, state, IPC, and failure contracts |
 | What happens from install through uninstall/reinstall? | [Lifecycle](lifecycle.md) | command-by-command operational lifecycle |
 | What should become trustworthy next? | [Roadmap](roadmap.md) | Runtime → Observe → Detect → Intervene → Recover → Harden, with evidence gates |
-| Which papers/ideas inform the design, and what remains unproven? | [Research](research.md) | literature-to-mechanism map + evidence questions |
+| What prior papers/systems should I study, and what does Spotter borrow from them? | [Reference](reference.md) | literature + implementation precedents, boundaries, and implementation hints |
+| What hypotheses remain unproven, and how will Spotter evaluate them? | [Research](research.md) | evidence posture, research questions, experiments, and metrics |
 | How should code, issue metadata, branches, commits, tests, and docs be structured? | [Conventions](conventions.md) | repository-wide working conventions |
 | How do I contribute? | [Contributing](../CONTRIBUTING.md) | issue/PR workflow, setup, triage, and review expectations |
 
@@ -34,6 +35,8 @@ Architecture
   ↓
 Lifecycle
   ↓
+Reference → implementation precedents as needed
+  ↓
 Roadmap → Runtime / Observe
 ```
 
@@ -41,6 +44,8 @@ Roadmap → Runtime / Observe
 
 ```text
 Concept
+  ↓
+Reference
   ↓
 Research
   ↓
@@ -107,7 +112,8 @@ To avoid maintaining duplicate specifications:
 - **Architecture** owns runtime components, process/data flow, state ownership, IPC, and failure contracts.
 - **Lifecycle** owns package/service/integration/session/update/removal behavior.
 - **Roadmap** owns named stages, dependencies, and evidence gates.
-- **Research** owns prior work, hypotheses, evidence, and evaluation questions.
+- **Reference** owns prior papers/systems, what they demonstrate, implementation precedents, and what Spotter should or should not borrow.
+- **Research** owns Spotter's hypotheses, evidence state, evaluation questions, experiment design, and metrics.
 - **Conventions** owns repository-wide code/test/git/issue-metadata/documentation conventions.
 - **Contributing** owns the human contribution workflow.
 
