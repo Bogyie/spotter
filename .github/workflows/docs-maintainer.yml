@@ -77,6 +77,7 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: ${{ inputs.writer_model }}
           permission-profile: ":workspace"
+          safety-strategy: unsafe
           prompt: |
             Read .codex-maintainer/docs-scout.md and .codex-maintainer/docs-context.json, then independently
             verify every proposed change against the implementation, tests, open issues,
