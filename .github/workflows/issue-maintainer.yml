@@ -115,7 +115,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: ${{ inputs.scout_model }}
-          sandbox: read-only
+          permission-profile: ":read-only"
           output-file: .codex-maintainer/scout.md
           prompt: |
             Act only as a repository scout. Compare all documentation, roadmap and status
@@ -134,7 +134,8 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: ${{ inputs.decision_model }}
-          sandbox: read-only
+          permission-profile: ":read-only"
+          safety-strategy: unsafe
           output-file: .codex-maintainer/issue-plan.json
           output-schema: |
             {
