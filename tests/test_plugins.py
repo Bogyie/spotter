@@ -24,13 +24,11 @@ def test_plugin_manifests_and_hooks_are_well_formed() -> None:
     assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"}
 
 
-def test_readme_uses_remote_marketplace_install_commands() -> None:
+def test_readme_uses_supported_package_and_setup_commands() -> None:
     readme = Path("README.md").read_text()
 
-    assert "codex plugin marketplace add spotter-agent/spotter" in readme
-    assert "codex plugin add spotter@spotter" in readme
-    assert "claude plugin marketplace add spotter-agent/spotter" in readme
-    assert "claude plugin install spotter@spotter" in readme
+    assert "brew install spotter-agent/spotter/spotter" in readme
+    assert "spotter setup codex --dry-run\nspotter setup codex\nspotter doctor" in readme
 
 
 def test_bundled_hook_runs_without_installing_package(tmp_path: Path) -> None:
