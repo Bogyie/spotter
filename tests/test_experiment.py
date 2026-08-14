@@ -291,6 +291,59 @@ def test_arm_rechecks_environment_immediately_before_agent_run(
     assert result[5] == "ENVIRONMENT_MISMATCH:TRACKED_STATE_MISMATCH"
 
 
+def test_unchanged_declared_resource_recheck_reaches_agent_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ForkPlan(
+        "fork",
+        5,
+        "/wt",
+        "/rollout",
+        "codex ...",
+        manifest="/manifest.json",
+        prefix_id="prefix",
+        environment_fingerprint="expected",
+    )
+    expected = SimpleNamespace(
+        fingerprint_sha256="expected",
+        declared_resources=(SimpleNamespace(path=".fixture-config"),),
+    )
+    monkeypatch.setattr(
+        experiment,
+        "fingerprint_environment",
+        lambda path, resources: expected,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "load_fork_manifest",
+        lambda path: SimpleNamespace(environment=expected),
+    )
+    ran: list[str] = []
+
+    def run_arm(*args: object, **kwargs: object) -> int:
+        ran.append("run")
+        return 0
+
+    monkeypatch.setattr(experiment, "_run_arm", run_arm)
+
+    result = experiment._execute_arm(
+        plan,
+        "Continue the task.",
+        "MATCHED",
+        check=None,
+        sandbox="workspace-write",
+        timeout=1,
+        model=None,
+        reasoning_effort=None,
+        codex_home=None,
+    )
+
+    assert ran == ["run"]
+    assert result[0] == 0
+    assert result[2] == ArmClassification.UNJUDGEABLE
+    assert result[5] is None
+
+
 def test_arm_environment_drift_is_persisted_and_summarized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -324,6 +377,46 @@ def test_arm_environment_drift_is_persisted_and_summarized(
         for result in results
     )
     assert "environment mismatches=1/1" in summarize(results)
+
+
+def test_source_environment_drift_blocks_both_arms_before_agent_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counter: dict[str, int] = {}
+
+    def mismatched_fork(*args: object, **kwargs: object) -> ForkPlan:
+        plan = _fake_fork(counter)("s1", 5)
+        return ForkPlan(
+            plan.session_id,
+            plan.branch_step,
+            plan.worktree,
+            plan.rollout,
+            plan.command,
+            prefix_id=plan.prefix_id,
+            environment_fingerprint=plan.environment_fingerprint,
+            source_environment_preflight=("SOURCE_ENVIRONMENT_MISMATCH:MISSING_IGNORED_FILE"),
+        )
+
+    ran: list[str] = []
+    monkeypatch.setattr(experiment, "fork", mismatched_fork)
+    monkeypatch.setattr(experiment, "_run_arm", lambda *args, **kwargs: ran.append("run"))
+    monkeypatch.setattr(experiment, "_cleanup", lambda worktree: None)
+
+    results = run_experiment(
+        "s1",
+        5,
+        None,
+        run=True,
+        neutral=True,
+        environment_resources=(".env",),
+    )
+
+    assert ran == []
+    assert all(result.classification == ArmClassification.INFRA_FAIL for result in results)
+    assert all(
+        result.environment_preflight == "SOURCE_ENVIRONMENT_MISMATCH:MISSING_IGNORED_FILE"
+        for result in results
+    )
 
 
 def test_explicit_source_config_mismatch_prevents_agent_runs(
