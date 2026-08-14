@@ -17,6 +17,7 @@ from uuid import uuid4
 from spotter.app_server import (
     AppServerCapabilities,
     AppServerError,
+    AppServerRpcError,
     AppServerTransportError,
     CapabilityStatus,
     CodexAppServerClient,
@@ -26,7 +27,7 @@ from spotter.ingestion import AppServerTraceIngestor, IngestionError
 from spotter.observability import state_coverage_status
 from spotter.review_scheduler import ReviewerJob, ReviewScheduler
 from spotter.signals import SignalEngine, deterministic_block_equivalence
-from spotter.snapshot import StepRecord
+from spotter.snapshot import StepRecord, capture_receipt_timing
 from spotter.thread_state import ThreadState, ThreadStateError, ThreadStateStore
 from spotter.trace import TraceEvent, TraceProvenance
 
@@ -57,12 +58,21 @@ class RecoveryMetrics:
     reconnect_failures: int = 0
     observation_gaps: int = 0
     last_recovery_seconds: float | None = None
+    control_telemetry_dropped: int = 0
+    control_telemetry_errors: int = 0
+    control_telemetry_backlog_peak: int = 0
 
 
 @dataclass(frozen=True)
 class RuntimeControlTarget:
     identity: RuntimeIdentity
     connection_epoch: int
+
+
+@dataclass(frozen=True)
+class _QueuedControlEvent:
+    event: TraceEvent
+    observed_at: float
 
 
 class StaleControlTarget(AppServerError):
@@ -90,11 +100,14 @@ class AppServerRecoveryLoop:
         on_review_job: ReviewJobCallback | None = None,
         initial_backoff: float = 0.1,
         maximum_backoff: float = 30,
+        control_telemetry_queue_size: int = 256,
     ) -> None:
         if not endpoint.strip():
             raise ValueError("App Server endpoint must be non-empty")
         if initial_backoff < 0 or maximum_backoff < initial_backoff:
             raise ValueError("invalid reconnect backoff")
+        if control_telemetry_queue_size <= 0:
+            raise ValueError("control telemetry queue size must be positive")
         self.endpoint = endpoint
         self.thread_states = thread_states
         self.ingestor = AppServerTraceIngestor(journals_dir)
@@ -109,6 +122,7 @@ class AppServerRecoveryLoop:
         self.connection: ConnectionIdentity | None = None
         self.metrics = RecoveryMetrics()
         self.last_error: str | None = None
+        self.last_control_telemetry_error: str | None = None
         self.transitions: tuple[RecoveryState, ...] = (self.state,)
         self._connection_epoch = self.ingestor.last_connection_epoch
         self._client: CodexAppServerClient | None = None
@@ -117,8 +131,25 @@ class AppServerRecoveryLoop:
         self._retry = asyncio.Event()
         self._attachments: dict[ThreadId, AttachmentId] = {}
         self._disconnected_at: float | None = None
+        self._control_telemetry_queue_size = control_telemetry_queue_size
+        self._control_telemetry_queue: asyncio.Queue[_QueuedControlEvent] | None = None
+        self._control_telemetry_writer: asyncio.Task[None] | None = None
+        self._control_telemetry_ids: set[str] = set()
+        self._control_request_ids: set[str] = set()
 
         records = self.ingestor.records()
+        self._control_telemetry_ids.update(
+            record.event.event_id
+            for record in records
+            if record.event.event_id is not None and record.event.kind.startswith("control_")
+        )
+        self._control_request_ids.update(
+            control_id
+            for record in records
+            if (control_id := record.event.payload.get("control_id")) is not None
+            and isinstance(control_id, str)
+            and control_id
+        )
         if records:
             self.thread_states.hydrate(records)
             for candidate, trigger in self.signals.hydrate(records):
@@ -144,7 +175,20 @@ class AppServerRecoveryLoop:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        await self.flush_control_telemetry()
+        if self._control_telemetry_writer is not None:
+            self._control_telemetry_writer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._control_telemetry_writer
+            self._control_telemetry_writer = None
+            self._control_telemetry_queue = None
         self._set_state(RecoveryState.DISCONNECTED)
+
+    async def flush_control_telemetry(self) -> None:
+        """Wait until control telemetry already accepted by the queue is durable."""
+
+        if self._control_telemetry_queue is not None:
+            await self._control_telemetry_queue.join()
 
     def retry_now(self) -> None:
         self._retry.set()
@@ -220,13 +264,204 @@ class AppServerRecoveryLoop:
             and state.connection_epoch == job.target_connection_epoch
         )
 
-    async def steer(self, target: RuntimeControlTarget, text: str) -> Mapping[str, Any]:
-        client, thread_id, turn_id = self._validate_target(target)
-        return await client.steer(thread_id, turn_id, text)
+    async def steer(
+        self,
+        target: RuntimeControlTarget,
+        text: str,
+        *,
+        control_id: str | None = None,
+        review_job_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        return await self._dispatch_control(
+            target,
+            "steer",
+            text=text,
+            control_id=control_id,
+            review_job_id=review_job_id,
+        )
 
-    async def interrupt(self, target: RuntimeControlTarget) -> Mapping[str, Any]:
-        client, thread_id, turn_id = self._validate_target(target)
-        return await client.interrupt(thread_id, turn_id)
+    async def interrupt(
+        self,
+        target: RuntimeControlTarget,
+        *,
+        control_id: str | None = None,
+        review_job_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        return await self._dispatch_control(
+            target,
+            "interrupt",
+            control_id=control_id,
+            review_job_id=review_job_id,
+        )
+
+    async def _dispatch_control(
+        self,
+        target: RuntimeControlTarget,
+        control_kind: str,
+        *,
+        text: str | None = None,
+        control_id: str | None = None,
+        review_job_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        request_id = _control_request_id(control_id)
+        while control_id is None and request_id in self._control_request_ids:
+            request_id = _control_request_id(None)
+        payload = _control_payload(target, request_id, control_kind, review_job_id)
+        if request_id in self._control_request_ids:
+            raise ValueError("control_id must be unique across durable runtime history")
+        self._control_request_ids.add(request_id)
+        try:
+            client, thread_id, turn_id = self._validate_target(target)
+        except StaleControlTarget as error:
+            self._record_control_event(
+                "control_terminal",
+                target,
+                payload,
+                outcome="stale",
+                reason_code="stale_target",
+                error=error,
+            )
+            raise
+
+        self._record_control_event("control_dispatch_started", target, payload)
+        try:
+            if control_kind == "steer":
+                assert text is not None
+                result = await client.steer(
+                    thread_id,
+                    turn_id,
+                    text,
+                    client_user_message_id=request_id,
+                )
+            else:
+                result = await client.interrupt(thread_id, turn_id)
+        except asyncio.CancelledError as error:
+            self._record_control_event(
+                "control_terminal",
+                target,
+                payload,
+                outcome="unknown",
+                reason_code="cancelled_after_dispatch",
+                error=error,
+            )
+            raise
+        except AppServerRpcError as error:
+            self._record_control_event(
+                "control_terminal",
+                target,
+                payload,
+                outcome="failed",
+                reason_code="rpc_rejected",
+                error=error,
+            )
+            raise
+        except AppServerError as error:
+            self._record_control_event(
+                "control_terminal",
+                target,
+                payload,
+                outcome="unknown",
+                reason_code="acceptance_unknown",
+                error=error,
+            )
+            raise
+
+        accepted = dict(payload)
+        accepted_turn_id = result.get("turnId")
+        if isinstance(accepted_turn_id, str) and accepted_turn_id:
+            accepted["accepted_turn_id"] = accepted_turn_id
+        self._record_control_event("control_rpc_accepted", target, accepted)
+        return result
+
+    def _record_control_event(
+        self,
+        kind: str,
+        target: RuntimeControlTarget,
+        payload: Mapping[str, object],
+        *,
+        outcome: str | None = None,
+        reason_code: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        event_payload = dict(payload)
+        if outcome is not None:
+            event_payload["outcome"] = outcome
+        if reason_code is not None:
+            event_payload["reason_code"] = reason_code
+        if error is not None:
+            event_payload["error_type"] = type(error).__name__
+        control_id = event_payload["control_id"]
+        phase = outcome or kind.removeprefix("control_")
+        observed_at, observed_monotonic_ns, monotonic_clock_id = capture_receipt_timing()
+        self._enqueue_control_event(
+            _QueuedControlEvent(
+                TraceEvent(
+                    kind,
+                    event_payload,
+                    event_id=f"spotter:control:{control_id}:{phase}",
+                    occurred_at=observed_at,
+                    identity=target.identity,
+                    provenance=TraceProvenance("spotterd", "runtime_control"),
+                    connection_epoch=target.connection_epoch,
+                    observed_monotonic_ns=observed_monotonic_ns,
+                    monotonic_clock_id=monotonic_clock_id,
+                ),
+                observed_at,
+            )
+        )
+
+    def _enqueue_control_event(self, queued: _QueuedControlEvent) -> None:
+        event_id = queued.event.event_id
+        if event_id is not None and event_id in self._control_telemetry_ids:
+            return
+        if self._control_telemetry_queue is None:
+            self._control_telemetry_queue = asyncio.Queue(
+                maxsize=self._control_telemetry_queue_size
+            )
+        if self._control_telemetry_writer is None or self._control_telemetry_writer.done():
+            self._control_telemetry_writer = asyncio.create_task(
+                self._write_control_telemetry(), name="spotter-control-telemetry"
+            )
+        try:
+            self._control_telemetry_queue.put_nowait(queued)
+        except asyncio.QueueFull:
+            self.metrics = replace(
+                self.metrics,
+                control_telemetry_dropped=self.metrics.control_telemetry_dropped + 1,
+            )
+            self.last_control_telemetry_error = "control telemetry queue is full"
+            return
+        if event_id is not None:
+            self._control_telemetry_ids.add(event_id)
+        self.metrics = replace(
+            self.metrics,
+            control_telemetry_backlog_peak=max(
+                self.metrics.control_telemetry_backlog_peak,
+                self._control_telemetry_queue.qsize(),
+            ),
+        )
+
+    async def _write_control_telemetry(self) -> None:
+        assert self._control_telemetry_queue is not None
+        queue = self._control_telemetry_queue
+        while True:
+            queued = await queue.get()
+            try:
+                record = await asyncio.to_thread(
+                    self.ingestor.append_operational,
+                    queued.event,
+                    observed_at=queued.observed_at,
+                )
+                self.ingestor.index_operational(record)
+                self.last_control_telemetry_error = None
+            except Exception as error:
+                self.metrics = replace(
+                    self.metrics,
+                    control_telemetry_errors=self.metrics.control_telemetry_errors + 1,
+                )
+                self.last_control_telemetry_error = str(error)
+            finally:
+                queue.task_done()
 
     async def _run(self) -> None:
         delay = self.initial_backoff
@@ -599,6 +834,39 @@ async def _cancel_task(task: asyncio.Task[Any]) -> None:
         task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+def _control_request_id(value: str | None) -> str:
+    if value is None:
+        return f"spotter-{uuid4().hex}"
+    if not value.strip():
+        raise ValueError("control_id must be non-empty")
+    return value
+
+
+def _control_payload(
+    target: RuntimeControlTarget,
+    control_id: str,
+    control_kind: str,
+    review_job_id: str | None,
+) -> dict[str, object]:
+    if review_job_id is not None and not review_job_id.strip():
+        raise ValueError("review_job_id must be non-empty")
+    identity = target.identity
+    payload: dict[str, object] = {
+        "control_id": control_id,
+        "control_kind": control_kind,
+        "target_connection_epoch": target.connection_epoch,
+    }
+    if identity.turn_id is not None:
+        payload["target_turn_id"] = identity.turn_id.value
+    if identity.attachment_id is not None:
+        payload["runtime_attachment_id"] = identity.attachment_id.value
+    if review_job_id is not None:
+        payload["review_job_id"] = review_job_id
+    if control_kind == "steer":
+        payload["client_user_message_id"] = control_id
+    return payload
 
 
 def _active_turn_id(thread: Mapping[str, Any]) -> str | None:

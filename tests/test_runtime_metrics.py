@@ -1,9 +1,13 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from spotter.app_server import AppServerEvent
+from spotter.hook import event_from_hook
 from spotter.identity import IdentityProvenance, RuntimeIdentity, ThreadId, TurnId
+from spotter.ingestion import CodexTraceNormalizer
 from spotter.runtime_metrics import (
     CoveredCount,
     ObjectiveOutcomeError,
@@ -96,6 +100,71 @@ def test_objective_outcomes_join_costs_by_durable_arm_identity(tmp_path: Path) -
     assert "guidance tokens=200 (1/1 arms), elapsed=avg=2000.00ms" in rendered
     assert "neutral_a tokens=unknown (0/1 arms), elapsed=unknown (0/1)" in rendered
     assert "disagreements=1" in rendered
+
+
+def test_objective_outcomes_filter_by_explicit_session_provenance(tmp_path: Path) -> None:
+    manifest = tmp_path / "fork.json"
+    manifest.write_text(
+        json.dumps({"prefix": {"source_session_id": "source-session"}}),
+        encoding="utf-8",
+    )
+    path = tmp_path / "results.jsonl"
+    _write_rows(
+        path,
+        {
+            "result_schema_version": 1,
+            "run_id": "run-1",
+            "experiment_pair_id": "run-1:task-1",
+            "arm": "control",
+            "classification": "PASS",
+            "replay_source_session_id": "task-arm-session",
+        },
+        {
+            "result_schema_version": 3,
+            "experiment_id": "experiment-1",
+            "pair": 0,
+            "arm": "guidance",
+            "classification": "TASK_FAIL",
+            "session_id": "fork-arm-session",
+            "fork_manifest": str(manifest),
+        },
+        {
+            "result_schema_version": 1,
+            "run_id": "run-2",
+            "experiment_pair_id": "run-2:task-2",
+            "arm": "control",
+            "classification": "PASS",
+        },
+    )
+
+    assert measure_objective_outcomes([path], session_id="task-arm-session").arms == 1
+    assert measure_objective_outcomes([path], session_id="fork-arm-session").arms == 1
+    source_report = measure_objective_outcomes([path], session_id="source-session")
+    assert source_report.arms == 1
+    assert source_report.failing_arms == 1
+    assert measure_objective_outcomes([path], session_id="unrelated").arms == 0
+    assert "durable provenance to session source-session" in render_objective_outcomes(
+        source_report, session_id="source-session"
+    )
+
+
+def test_objective_session_join_rejects_unreadable_fork_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "results.jsonl"
+    _write_rows(
+        path,
+        {
+            "result_schema_version": 3,
+            "experiment_id": "experiment-1",
+            "pair": 0,
+            "arm": "guidance",
+            "classification": "PASS",
+            "session_id": "fork-arm-session",
+            "fork_manifest": str(tmp_path / "missing.json"),
+        },
+    )
+
+    with pytest.raises(ObjectiveOutcomeError, match="cannot read fork provenance"):
+        measure_objective_outcomes([path], session_id="source-session")
 
 
 def test_objective_outcomes_reject_unknown_persisted_schema(tmp_path: Path) -> None:
@@ -333,6 +402,9 @@ def test_runtime_costs_keep_surfaces_domains_and_coverage_separate() -> None:
     assert report.main_token_breakdown.reasoning_output.value == 1
     assert report.reviewer_calls == 1
     assert report.reviewer_tokens == 25
+    assert report.reviewer_sessions == 1
+    assert report.reviewer_token_sessions == 1
+    assert report.reviewer_token_observations == 1
     assert report.reviewer_jobs_queued == report.reviewer_jobs_started == 1
     assert report.reviewer_queue_ms == (4.0,)
     assert report.reviewer_inference_finishes == 1
@@ -362,6 +434,91 @@ def test_runtime_costs_keep_surfaces_domains_and_coverage_separate() -> None:
     assert "cpu=0.250s, peak_rss=1024 bytes; samples=1/1 gate calls" in rendered
     assert "arrival_order=5/5" in rendered
     assert "turn_wall(source)=avg=2000.00ms max=2000.00ms (1/1)" in rendered
+
+
+def test_runtime_costs_deduplicate_hook_and_app_server_semantic_actions() -> None:
+    hook_identity = RuntimeIdentity.legacy_hook("codex", "session-1")
+    hook_provenance = TraceProvenance("codex_hook", "PreToolUse")
+    hook = [
+        _record(
+            0,
+            replace(
+                event_from_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Bash",
+                        "tool_use_id": "call-shared",
+                        "tool_input": {"command": "python check.py", "files": ["src/a.py"]},
+                    }
+                ),
+                identity=hook_identity,
+                provenance=hook_provenance,
+            ),
+        ),
+        _record(
+            1,
+            replace(
+                event_from_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": "Bash",
+                        "tool_use_id": "call-shared",
+                        "tool_input": {"command": "python check.py"},
+                        "tool_response": {"exit_code": 1},
+                    }
+                ),
+                identity=hook_identity,
+                provenance=TraceProvenance("codex_hook", "PostToolUse"),
+            ),
+        ),
+    ]
+    normalizer = CodexTraceNormalizer()
+
+    def app_item(method: str, status: str) -> TraceEvent:
+        return replace(
+            normalizer.normalize(
+                AppServerEvent(
+                    method,
+                    {
+                        "method": method,
+                        "params": {
+                            "threadId": "external-thread",
+                            "turnId": "external-turn",
+                            "item": {
+                                "id": "call-shared",
+                                "type": "commandExecution",
+                                "command": "python check.py",
+                                "status": status,
+                                "durationMs": 10,
+                            },
+                        },
+                    },
+                )
+            ),
+            connection_epoch=1,
+        )
+
+    app_server = [
+        _record(0, app_item("item/started", "inProgress")),
+        _record(1, app_item("item/completed", "completed")),
+    ]
+
+    report = measure_runtime_costs([(hook, 10), (app_server, 10)])
+
+    assert report.cross_surface_action_overlaps == 1
+    assert report.surfaces["hook"].actions == 0
+    assert report.surfaces["hook"].action_observations == 2
+    assert report.surfaces["hook"].outcome_observations == 1
+    assert report.surfaces["app_server"].actions == 1
+    assert report.surfaces["app_server"].outcomes == 1
+    assert report.surfaces["app_server"].failed_outcomes == 0
+    assert report.surfaces["app_server"].actions_by_family == {"command": 1}
+    assert report.surfaces["app_server"].unique_resources == 2
+    assert report.tool_duration_ms == (10.0,)
+    rendered = render_runtime_costs(report)
+    assert "cross_surface_overlap=1" in rendered
+    assert "hook: actions=0 (from 2 observations)" in rendered
+    assert "app_server: actions=1 (from 2 observations)" in rendered
 
 
 def test_supervision_lifecycle_uses_correlated_monotonic_receipts() -> None:
@@ -563,6 +720,332 @@ def test_supervision_lead_and_lag_use_the_target_turn_monotonic_boundary() -> No
     assert "lag=avg=300.00ms max=300.00ms (1/3)" in rendered
 
 
+def test_runtime_control_metrics_require_correlated_adoption_evidence() -> None:
+    identity = RuntimeIdentity(
+        ThreadId("thread-1"),
+        TurnId("turn-1"),
+        None,
+        IdentityProvenance("codex", "external-thread", "external-turn"),
+    )
+
+    def event(
+        kind: str,
+        payload: dict[str, object],
+        *,
+        event_id: str,
+        monotonic_ns: int,
+    ) -> TraceEvent:
+        return TraceEvent(
+            kind,
+            payload,
+            event_id=event_id,
+            identity=identity,
+            connection_epoch=1,
+            observed_monotonic_ns=monotonic_ns,
+            monotonic_clock_id="daemon-1",
+        )
+
+    target = {
+        "target_turn_id": "turn-1",
+        "target_connection_epoch": 1,
+    }
+    events = [
+        event(
+            "user_prompt",
+            {"client_user_message_id": "control-1"},
+            event_id="prompt-before-dispatch",
+            monotonic_ns=1_650_000_000,
+        ),
+        event("tool_result", {}, event_id="evidence-1", monotonic_ns=1_000_000_000),
+        event(
+            "signal_candidate",
+            {
+                "signal_id": "signal-1",
+                "status": "active",
+                "evidence_event_ids": ["evidence-1"],
+            },
+            event_id="signal-1",
+            monotonic_ns=1_100_000_000,
+        ),
+        event(
+            "review_job_queued",
+            {"review_job_id": "job-1", "signal_id": "signal-1"},
+            event_id="queued-1",
+            monotonic_ns=1_200_000_000,
+        ),
+        event(
+            "reviewer_decision",
+            {"review_job_id": "job-1", **target},
+            event_id="decision-1",
+            monotonic_ns=1_500_000_000,
+        ),
+        event(
+            "control_dispatch_started",
+            {
+                "control_id": "control-1",
+                "control_kind": "steer",
+                "client_user_message_id": "control-1",
+                "review_job_id": "job-1",
+                **target,
+            },
+            event_id="dispatch-1",
+            monotonic_ns=1_600_000_000,
+        ),
+        event(
+            "control_rpc_accepted",
+            {
+                "control_id": "control-1",
+                "control_kind": "steer",
+                "client_user_message_id": "control-1",
+                "review_job_id": "job-1",
+                **target,
+            },
+            event_id="accepted-1",
+            monotonic_ns=1_700_000_000,
+        ),
+        event(
+            "control_rpc_accepted",
+            {
+                "control_id": "control-1",
+                "control_kind": "steer",
+                "client_user_message_id": "control-1",
+                "review_job_id": "job-1",
+                **target,
+            },
+            event_id="accepted-1-duplicate",
+            monotonic_ns=1_750_000_000,
+        ),
+        event(
+            "control_terminal",
+            {
+                "control_id": "control-stale",
+                "control_kind": "steer",
+                "review_job_id": "job-1",
+                "outcome": "stale",
+                **target,
+            },
+            event_id="stale-1",
+            monotonic_ns=1_800_000_000,
+        ),
+        event(
+            "user_prompt",
+            {"client_user_message_id": "control-1"},
+            event_id="prompt-1",
+            monotonic_ns=1_900_000_000,
+        ),
+        event(
+            "user_prompt",
+            {"client_user_message_id": "control-1"},
+            event_id="prompt-1-duplicate",
+            monotonic_ns=1_950_000_000,
+        ),
+        event(
+            "turn_completed",
+            {},
+            event_id="completed-1",
+            monotonic_ns=2_100_000_000,
+        ),
+        event(
+            "control_rpc_accepted",
+            {
+                "control_id": "control-2",
+                "control_kind": "steer",
+                "client_user_message_id": "control-2",
+                **target,
+            },
+            event_id="accepted-2",
+            monotonic_ns=2_200_000_000,
+        ),
+        event(
+            "control_dispatch_started",
+            {"control_id": "control-3", "control_kind": "interrupt", **target},
+            event_id="dispatch-3",
+            monotonic_ns=2_300_000_000,
+        ),
+        event(
+            "control_terminal",
+            {
+                "control_id": "control-3",
+                "control_kind": "interrupt",
+                "outcome": "failed",
+                **target,
+            },
+            event_id="failed-3",
+            monotonic_ns=2_400_000_000,
+        ),
+        event(
+            "control_dispatch_started",
+            {"control_id": "control-4", "control_kind": "interrupt", **target},
+            event_id="dispatch-4",
+            monotonic_ns=2_500_000_000,
+        ),
+        event(
+            "control_terminal",
+            {
+                "control_id": "control-4",
+                "control_kind": "interrupt",
+                "outcome": "unknown",
+                **target,
+            },
+            event_id="unknown-4",
+            monotonic_ns=2_600_000_000,
+        ),
+    ]
+
+    report = measure_runtime_costs(
+        [([_record(index, item) for index, item in enumerate(events)], 10)]
+    )
+
+    assert report.control_dispatches == 3
+    assert report.control_dispatch_finishes == 3
+    assert report.control_rpc_accepted == 2
+    assert report.control_failed == 1
+    assert report.control_unknown == 1
+    assert report.control_stale == 1
+    assert report.control_ambiguous_ids == 0
+    assert report.control_adoption_eligible == 2
+    assert report.control_adoptions == 1
+    assert report.control_dispatch_ms == (100.0, 100.0, 100.0)
+    assert report.control_adoption_ms == (200.0,)
+    assert report.control_detection_to_adoption_ms == (900.0,)
+    assert report.control_adoption_lead_ms == (200.0,)
+    assert report.control_adoption_lag_ms == ()
+    assert report.control_stale_delivery_ms == (300.0,)
+    rendered = render_runtime_costs(report)
+    assert "dispatches=3 accepted=2 failed=1 unknown=1 stale=1" in rendered
+    assert "adoption=avg=200.00ms max=200.00ms (1/1) (1/2 accepted steers observed)" in rendered
+    assert "detection_to_adoption=avg=900.00ms max=900.00ms (1/1)" in rendered
+    assert "stale_delivery=avg=300.00ms max=300.00ms (1/1)" in rendered
+
+
+def test_reused_control_id_is_ambiguous_and_cannot_adopt() -> None:
+    identity = RuntimeIdentity(
+        ThreadId("thread-1"),
+        TurnId("turn-1"),
+        None,
+        IdentityProvenance("codex", "external-thread", "external-turn"),
+    )
+
+    def event(kind: str, event_id: str, monotonic_ns: int) -> TraceEvent:
+        return TraceEvent(
+            kind,
+            {
+                "control_id": "control-reused",
+                "control_kind": "steer",
+                "client_user_message_id": "control-reused",
+                "target_turn_id": "turn-1",
+                "target_connection_epoch": 1,
+            },
+            event_id=event_id,
+            identity=identity,
+            connection_epoch=1,
+            observed_monotonic_ns=monotonic_ns,
+            monotonic_clock_id="daemon-1",
+        )
+
+    events = [
+        event("control_dispatch_started", "dispatch-1", 1_000_000_000),
+        event("control_rpc_accepted", "accepted-1", 1_100_000_000),
+        TraceEvent(
+            "user_prompt",
+            {"client_user_message_id": "control-reused"},
+            event_id="prompt-1",
+            identity=identity,
+            connection_epoch=1,
+            observed_monotonic_ns=1_200_000_000,
+            monotonic_clock_id="daemon-1",
+        ),
+        event("control_dispatch_started", "dispatch-2", 1_300_000_000),
+        event("control_rpc_accepted", "accepted-2", 1_400_000_000),
+        TraceEvent(
+            "user_prompt",
+            {"client_user_message_id": "control-reused"},
+            event_id="prompt-2",
+            identity=identity,
+            connection_epoch=1,
+            observed_monotonic_ns=1_500_000_000,
+            monotonic_clock_id="daemon-1",
+        ),
+    ]
+
+    report = measure_runtime_costs(
+        [([_record(index, item) for index, item in enumerate(events)], 10)]
+    )
+
+    assert report.control_dispatches == 1
+    assert report.control_rpc_accepted == 1
+    assert report.control_ambiguous_ids == 1
+    assert report.control_adoption_eligible == 1
+    assert report.control_adoptions == 0
+    assert report.control_adoption_ms == ()
+    assert "ambiguous_ids=1" in render_runtime_costs(report)
+
+
+def test_raw_control_correlation_reaches_metrics_without_double_counting() -> None:
+    raw = AppServerEvent(
+        "item/completed",
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "external-thread",
+                "turnId": "external-turn",
+                "item": {
+                    "id": "message-1",
+                    "type": "userMessage",
+                    "clientId": "control-1",
+                    "content": [{"type": "text", "text": "verify this"}],
+                },
+                "completedAtMs": 1_000,
+            },
+        },
+    )
+    normalized = CodexTraceNormalizer().normalize(raw)
+    assert normalized.identity is not None and normalized.identity.turn_id is not None
+    prompt = replace(
+        normalized,
+        connection_epoch=1,
+        observed_monotonic_ns=1_200_000_000,
+        monotonic_clock_id="daemon-1",
+    )
+    accepted = TraceEvent(
+        "control_rpc_accepted",
+        {
+            "control_id": "control-1",
+            "control_kind": "steer",
+            "client_user_message_id": "control-1",
+            "target_turn_id": normalized.identity.turn_id.value,
+            "target_connection_epoch": 1,
+        },
+        event_id="accepted-1",
+        identity=normalized.identity,
+        connection_epoch=1,
+        observed_monotonic_ns=1_000_000_000,
+        monotonic_clock_id="daemon-1",
+    )
+    dispatch = replace(
+        accepted,
+        kind="control_dispatch_started",
+        event_id="dispatch-1",
+        observed_monotonic_ns=900_000_000,
+    )
+    records = [
+        _record(0, dispatch),
+        _record(1, dispatch),
+        _record(2, accepted),
+        _record(3, accepted),
+        _record(4, prompt),
+        _record(5, prompt),
+    ]
+
+    report = measure_runtime_costs([(records, 10)])
+
+    assert prompt.payload["client_user_message_id"] == "control-1"
+    assert report.control_rpc_accepted == 1
+    assert report.control_adoption_eligible == 1
+    assert report.control_adoptions == 1
+    assert report.control_adoption_ms == (200.0,)
+
+
 def test_repeated_action_metrics_reuse_durable_signal_features() -> None:
     records = [
         _record(
@@ -658,6 +1141,36 @@ def test_unavailable_runtime_metrics_render_unknown_not_zero() -> None:
     assert "receipt_wall=0/1" in rendered
     assert "monotonic_receipt=0/1 across 0 clock domains" in rendered
     assert "equivalent_actions=unknown (0/0 signal lifecycles)" in rendered
+    assert (
+        "recorded_session_tokens=unknown (0/0 reviewer sessions, 0/0 calls; unavailable)"
+        in rendered
+    )
+
+
+def test_reviewer_tokens_report_partial_call_and_session_coverage() -> None:
+    first_session = [
+        _record(
+            0,
+            TraceEvent("reviewer_decision", {"spend": {"session_tokens": 5}}),
+        ),
+        _record(1, TraceEvent("reviewer_decision", {})),
+    ]
+    second_session = [
+        _record(
+            0,
+            TraceEvent("reviewer_decision", {"spend": {"session_tokens": 7}}),
+        )
+    ]
+
+    report = measure_runtime_costs([(first_session, 10), (second_session, 10)])
+
+    assert report.reviewer_calls == 3
+    assert report.reviewer_sessions == 2
+    assert report.reviewer_token_observations == 2
+    assert report.reviewer_token_sessions == 1
+    assert report.reviewer_tokens == 7
+    rendered = render_runtime_costs(report)
+    assert "recorded_session_tokens=7 (1/2 reviewer sessions, 2/3 calls; partial)" in rendered
 
 
 def test_cumulative_token_updates_use_latest_and_report_field_coverage() -> None:

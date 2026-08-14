@@ -5,13 +5,14 @@ import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
 from spotter.outcomes import outcome_failure
 from spotter.snapshot import StepRecord
+from spotter.trace import TraceEvent
 
 _START_KINDS = {"tool_proposal", "command_started", "tool_started", "file_change_started"}
 _OUTCOME_KINDS = {"tool_result", "command_result", "file_edit"}
@@ -75,6 +76,7 @@ class RuntimeCostReport:
     sessions: int
     events: int
     surfaces: Mapping[str, SurfaceCost]
+    cross_surface_action_overlaps: int
     completed_turns: int
     token_turns: int
     token_observations: int
@@ -82,6 +84,9 @@ class RuntimeCostReport:
     main_token_breakdown: TokenBreakdown
     reviewer_calls: int
     reviewer_tokens: int | None
+    reviewer_sessions: int
+    reviewer_token_sessions: int
+    reviewer_token_observations: int
     signal_candidates_active: int
     repeated_equivalent_actions: CoveredCount
     reads_without_frontier_expansion: CoveredCount
@@ -99,6 +104,21 @@ class RuntimeCostReport:
     reviewer_end_to_end_ms: tuple[float, ...]
     reviewer_decision_lead_ms: tuple[float, ...]
     reviewer_decision_lag_ms: tuple[float, ...]
+    control_dispatches: int
+    control_dispatch_finishes: int
+    control_rpc_accepted: int
+    control_failed: int
+    control_unknown: int
+    control_stale: int
+    control_ambiguous_ids: int
+    control_adoption_eligible: int
+    control_adoptions: int
+    control_dispatch_ms: tuple[float, ...]
+    control_adoption_ms: tuple[float, ...]
+    control_detection_to_adoption_ms: tuple[float, ...]
+    control_adoption_lead_ms: tuple[float, ...]
+    control_adoption_lag_ms: tuple[float, ...]
+    control_stale_delivery_ms: tuple[float, ...]
     turn_wall_ms: tuple[float, ...]
     tool_duration_ms: tuple[float, ...]
     gate_calls: int
@@ -181,30 +201,64 @@ class _ReviewLifecycle:
     decision_lag_ms: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class _ControlLifecycle:
+    dispatches: int
+    dispatch_finishes: int
+    rpc_accepted: int
+    failed: int
+    unknown: int
+    stale: int
+    ambiguous_ids: int
+    adoption_eligible: int
+    adoptions: int
+    dispatch_ms: tuple[float, ...]
+    adoption_ms: tuple[float, ...]
+    detection_to_adoption_ms: tuple[float, ...]
+    adoption_lead_ms: tuple[float, ...]
+    adoption_lag_ms: tuple[float, ...]
+    stale_delivery_ms: tuple[float, ...]
+
+
 def measure_runtime_costs(
     journals: Iterable[tuple[Iterable[StepRecord], int]],
 ) -> RuntimeCostReport:
-    surfaces: dict[str, SurfaceCost] = {"hook": SurfaceCost(), "app_server": SurfaceCost()}
     sessions = events = completed_turns = token_turns = token_observations = 0
     reviewer_calls = reviewer_tokens = journal_bytes = gate_calls = 0
+    reviewer_sessions = reviewer_token_sessions = reviewer_token_observations = 0
     signal_candidates_active = reviewer_jobs_queued = reviewer_jobs_started = 0
     repeated_actions = [0, 0, 0]
     no_frontier_reads = [0, 0, 0]
     reviewer_jobs_decided = reviewer_jobs_errored = reviewer_jobs_capped = 0
     reviewer_jobs_discarded = reviewer_jobs_stale = 0
+    control_dispatches = control_dispatch_finishes = control_rpc_accepted = 0
+    control_failed = control_unknown = control_stale = 0
+    control_ambiguous_ids = 0
+    control_adoption_eligible = control_adoptions = 0
     reviewer_inference_finishes = 0
-    reviewer_tokens_known = False
     token_sums = {field: 0 for field in _TOKEN_FIELDS}
     token_sessions = {field: 0 for field in _TOKEN_FIELDS}
-    resources_by_surface: dict[str, set[str]] = {"hook": set(), "app_server": set()}
-    resource_actions_by_surface = {"hook": 0, "app_server": 0}
-    tool_duration_ms: list[float] = []
+    action_surfaces: dict[str, set[str]] = {}
+    action_families: dict[str, str] = {}
+    outcome_families: dict[str, str] = {}
+    action_resources: dict[str, set[str]] = {}
+    outcomes: set[str] = set()
+    outcome_failures: dict[str, tuple[str, bool]] = {}
+    action_observations: Counter[str] = Counter()
+    outcome_observations: Counter[str] = Counter()
+    tool_durations: dict[str, tuple[str, float]] = {}
     reviewer_queue_ms: list[float] = []
     reviewer_inference_ms: list[float] = []
     signal_detection_ms: list[float] = []
     reviewer_end_to_end_ms: list[float] = []
     reviewer_decision_lead_ms: list[float] = []
     reviewer_decision_lag_ms: list[float] = []
+    control_dispatch_ms: list[float] = []
+    control_adoption_ms: list[float] = []
+    control_detection_to_adoption_ms: list[float] = []
+    control_adoption_lead_ms: list[float] = []
+    control_adoption_lag_ms: list[float] = []
+    control_stale_delivery_ms: list[float] = []
     turn_wall_ms: list[float] = []
     hook_ms: list[float] = []
     ipc_ms: list[float] = []
@@ -219,22 +273,15 @@ def measure_runtime_costs(
         records = tuple(records_iter)
         sessions += 1
         journal_bytes += size
-        surface = _surface(records)
-        actions: set[str] = set()
-        outcomes: set[str] = set()
-        action_families: dict[str, str] = {}
-        outcome_families: dict[str, str] = {}
-        action_resources: dict[str, set[str]] = {}
-        action_observations = outcome_observations = 0
-        classified: set[str] = set()
-        failed: set[str] = set()
         completed: set[str] = set()
         token_covered: set[str] = set()
         turn_starts: dict[tuple[str, int], float] = {}
         latest_main_tokens: Mapping[str, object] | None = None
         latest_reviewer_tokens: int | None = None
+        session_reviewer_calls = 0
         for record in records:
             event = record.event
+            surface = _event_surface(event)
             events += 1
             source_timestamps += event.occurred_at is not None
             receipt_timestamps += record.at is not None
@@ -247,25 +294,29 @@ def measure_runtime_costs(
                 monotonic_clock_ids.add(event.monotonic_clock_id)
             key = _action_key(record)
             if event.kind in _START_KINDS | _OUTCOME_KINDS:
-                action_observations += 1
+                action_observations[surface] += 1
                 if key is not None:
-                    actions.add(key)
-                    action_families.setdefault(key, _action_family(event.kind))
+                    action_surfaces.setdefault(key, set()).add(surface)
+                    if key not in action_families or surface == "app_server":
+                        action_families[key] = _action_family(event.kind)
                     if resources := _event_resources(event.payload):
                         action_resources.setdefault(key, set()).update(resources)
             if event.kind in _OUTCOME_KINDS:
-                outcome_observations += 1
+                outcome_observations[surface] += 1
                 if key is not None:
                     outcomes.add(key)
-                    outcome_families.setdefault(key, _action_family(event.kind))
+                    if key not in outcome_families or surface == "app_server":
+                        outcome_families[key] = _action_family(event.kind)
                     failure = outcome_failure(event.payload)
                     if failure is not None:
-                        classified.add(key)
-                    if failure is True:
-                        failed.add(key)
+                        previous_outcome = outcome_failures.get(key)
+                        if previous_outcome is None or surface == "app_server":
+                            outcome_failures[key] = (surface, failure)
             duration = _number(event.payload.get("durationMs"))
-            if duration is not None and event.kind in _OUTCOME_KINDS:
-                tool_duration_ms.append(duration)
+            if duration is not None and event.kind in _OUTCOME_KINDS and key is not None:
+                previous_duration = tool_durations.get(key)
+                if previous_duration is None or surface == "app_server":
+                    tool_durations[key] = (surface, duration)
             turn_id = _turn_id(record)
             clock = _turn_clock(record)
             if event.kind == "turn_started" and clock is not None:
@@ -285,11 +336,14 @@ def measure_runtime_costs(
                     latest_main_tokens = total
             if event.kind == "reviewer_decision":
                 reviewer_calls += 1
+                session_reviewer_calls += 1
+                latest_reviewer_tokens = None
                 spend = event.payload.get("spend")
                 if isinstance(spend, Mapping):
                     value = spend.get("session_tokens")
-                    if isinstance(value, int) and not isinstance(value, bool):
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         latest_reviewer_tokens = value
+                        reviewer_token_observations += 1
                 timing = event.payload.get("timing")
                 if _payload_id(event.payload, "review_job_id") is None and isinstance(
                     timing, Mapping
@@ -320,30 +374,22 @@ def measure_runtime_costs(
         reviewer_end_to_end_ms.extend(lifecycle.end_to_end_ms)
         reviewer_decision_lead_ms.extend(lifecycle.decision_lead_ms)
         reviewer_decision_lag_ms.extend(lifecycle.decision_lag_ms)
-        current = surfaces[surface]
-        surfaces[surface] = SurfaceCost(
-            actions=current.actions + len(actions),
-            action_observations=current.action_observations + action_observations,
-            outcomes=current.outcomes + len(outcomes),
-            outcome_observations=current.outcome_observations + outcome_observations,
-            classified_outcomes=current.classified_outcomes + len(classified),
-            failed_outcomes=current.failed_outcomes + len(failed),
-            actions_by_family=_merge_counts(
-                current.actions_by_family, Counter(action_families.values())
-            ),
-            classified_outcomes_by_family=_merge_counts(
-                current.classified_outcomes_by_family,
-                Counter(outcome_families[key] for key in classified),
-            ),
-            failed_outcomes_by_family=_merge_counts(
-                current.failed_outcomes_by_family,
-                Counter(outcome_families[key] for key in failed),
-            ),
-        )
-        resources_by_surface[surface].update(
-            resource for resources in action_resources.values() for resource in resources
-        )
-        resource_actions_by_surface[surface] += len(action_resources)
+        controls = _control_lifecycle(records)
+        control_dispatches += controls.dispatches
+        control_dispatch_finishes += controls.dispatch_finishes
+        control_rpc_accepted += controls.rpc_accepted
+        control_failed += controls.failed
+        control_unknown += controls.unknown
+        control_stale += controls.stale
+        control_ambiguous_ids += controls.ambiguous_ids
+        control_adoption_eligible += controls.adoption_eligible
+        control_adoptions += controls.adoptions
+        control_dispatch_ms.extend(controls.dispatch_ms)
+        control_adoption_ms.extend(controls.adoption_ms)
+        control_detection_to_adoption_ms.extend(controls.detection_to_adoption_ms)
+        control_adoption_lead_ms.extend(controls.adoption_lead_ms)
+        control_adoption_lag_ms.extend(controls.adoption_lag_ms)
+        control_stale_delivery_ms.extend(controls.stale_delivery_ms)
         completed_turns += len(completed)
         token_turns += len(completed & token_covered)
         if latest_main_tokens is not None:
@@ -353,14 +399,16 @@ def measure_runtime_costs(
                 if (value := _token_count(latest_main_tokens.get(field))) is not None:
                     token_sums[field] += value
                     token_sessions[field] += 1
+        if session_reviewer_calls:
+            reviewer_sessions += 1
         if latest_reviewer_tokens is not None:
-            reviewer_tokens_known = True
+            reviewer_token_sessions += 1
             reviewer_tokens += latest_reviewer_tokens
 
     latest_samples: dict[str, tuple[int, float, int]] = {}
     for (runtime_id, sample_seq), (cpu_seconds, peak_rss_bytes) in daemon_samples.items():
-        previous = latest_samples.get(runtime_id)
-        if previous is None or sample_seq > previous[0]:
+        previous_sample = latest_samples.get(runtime_id)
+        if previous_sample is None or sample_seq > previous_sample[0]:
             latest_samples[runtime_id] = (sample_seq, cpu_seconds, peak_rss_bytes)
 
     token_breakdown = TokenBreakdown(
@@ -371,27 +419,54 @@ def measure_runtime_costs(
         _covered_field("outputTokens", token_sums, token_sessions),
         _covered_field("reasoningOutputTokens", token_sums, token_sessions),
     )
-    surfaces = {
-        surface: replace(
-            cost,
-            unique_resources=(
-                len(resources_by_surface[surface]) if resource_actions_by_surface[surface] else None
-            ),
-            resource_actions=resource_actions_by_surface[surface],
-        )
-        for surface, cost in surfaces.items()
+    attributed_surfaces = {
+        key: ("app_server" if "app_server" in observed else "hook")
+        for key, observed in action_surfaces.items()
     }
+    classified = set(outcome_failures)
+    failed = {key for key, (_, failure) in outcome_failures.items() if failure}
+    surfaces: dict[str, SurfaceCost] = {}
+    for surface in ("hook", "app_server"):
+        actions = {key for key, owner in attributed_surfaces.items() if owner == surface}
+        surface_outcomes = outcomes & actions
+        surface_classified = classified & actions
+        surface_failed = failed & actions
+        resource_actions = {key for key in actions if key in action_resources}
+        resources = {
+            resource for key in resource_actions for resource in action_resources.get(key, set())
+        }
+        surfaces[surface] = SurfaceCost(
+            actions=len(actions),
+            action_observations=action_observations[surface],
+            outcomes=len(surface_outcomes),
+            outcome_observations=outcome_observations[surface],
+            classified_outcomes=len(surface_classified),
+            failed_outcomes=len(surface_failed),
+            actions_by_family=Counter(action_families[key] for key in actions),
+            classified_outcomes_by_family=Counter(
+                outcome_families[key] for key in surface_classified
+            ),
+            failed_outcomes_by_family=Counter(outcome_families[key] for key in surface_failed),
+            unique_resources=len(resources) if resource_actions else None,
+            resource_actions=len(resource_actions),
+        )
     return RuntimeCostReport(
         sessions=sessions,
         events=events,
         surfaces=surfaces,
+        cross_surface_action_overlaps=sum(
+            len(observed) > 1 for observed in action_surfaces.values()
+        ),
         completed_turns=completed_turns,
         token_turns=token_turns,
         token_observations=token_observations,
         cumulative_main_tokens=token_breakdown.total.value,
         main_token_breakdown=token_breakdown,
         reviewer_calls=reviewer_calls,
-        reviewer_tokens=reviewer_tokens if reviewer_tokens_known else None,
+        reviewer_tokens=reviewer_tokens if reviewer_token_sessions else None,
+        reviewer_sessions=reviewer_sessions,
+        reviewer_token_sessions=reviewer_token_sessions,
+        reviewer_token_observations=reviewer_token_observations,
         signal_candidates_active=signal_candidates_active,
         repeated_equivalent_actions=_total_covered_count(repeated_actions),
         reads_without_frontier_expansion=_total_covered_count(no_frontier_reads),
@@ -409,8 +484,23 @@ def measure_runtime_costs(
         reviewer_end_to_end_ms=tuple(reviewer_end_to_end_ms),
         reviewer_decision_lead_ms=tuple(reviewer_decision_lead_ms),
         reviewer_decision_lag_ms=tuple(reviewer_decision_lag_ms),
+        control_dispatches=control_dispatches,
+        control_dispatch_finishes=control_dispatch_finishes,
+        control_rpc_accepted=control_rpc_accepted,
+        control_failed=control_failed,
+        control_unknown=control_unknown,
+        control_stale=control_stale,
+        control_ambiguous_ids=control_ambiguous_ids,
+        control_adoption_eligible=control_adoption_eligible,
+        control_adoptions=control_adoptions,
+        control_dispatch_ms=tuple(control_dispatch_ms),
+        control_adoption_ms=tuple(control_adoption_ms),
+        control_detection_to_adoption_ms=tuple(control_detection_to_adoption_ms),
+        control_adoption_lead_ms=tuple(control_adoption_lead_ms),
+        control_adoption_lag_ms=tuple(control_adoption_lag_ms),
+        control_stale_delivery_ms=tuple(control_stale_delivery_ms),
         turn_wall_ms=tuple(turn_wall_ms),
-        tool_duration_ms=tuple(tool_duration_ms),
+        tool_duration_ms=tuple(duration for _, duration in tool_durations.values()),
         gate_calls=gate_calls,
         hook_ms=tuple(hook_ms),
         ipc_ms=tuple(ipc_ms),
@@ -571,6 +661,178 @@ def _review_lifecycle(records: tuple[StepRecord, ...]) -> _ReviewLifecycle:
     )
 
 
+def _control_lifecycle(records: tuple[StepRecord, ...]) -> _ControlLifecycle:
+    by_event_id = {
+        record.event.event_id: record for record in records if record.event.event_id is not None
+    }
+    signal_evidence: dict[str, StepRecord] = {}
+    job_signals: dict[str, str] = {}
+    decisions: dict[str, StepRecord] = {}
+    turn_boundaries: dict[tuple[str, str, int], StepRecord] = {}
+    dispatch_observations: dict[str, dict[str, StepRecord]] = {}
+    accepted_observations: dict[str, dict[str, StepRecord]] = {}
+    terminal_observations: dict[str, dict[str, StepRecord]] = {}
+    prompts: dict[str, list[StepRecord]] = {}
+
+    for record in records:
+        event = record.event
+        payload = event.payload
+        if event.kind == "turn_completed" and (turn_key := _review_turn_key(record)) is not None:
+            turn_boundaries.setdefault(turn_key, record)
+        if (
+            event.kind == "signal_candidate"
+            and payload.get("status") == "active"
+            and (signal_id := _payload_id(payload, "signal_id")) is not None
+        ):
+            evidence = payload.get("evidence_event_ids")
+            first = (
+                next(
+                    (
+                        by_event_id[event_id]
+                        for event_id in evidence
+                        if isinstance(event_id, str) and event_id in by_event_id
+                    ),
+                    None,
+                )
+                if isinstance(evidence, list)
+                else None
+            )
+            if first is not None:
+                signal_evidence.setdefault(signal_id, first)
+        job_id = _payload_id(payload, "review_job_id")
+        if event.kind == "review_job_queued" and job_id is not None:
+            if (signal_id := _payload_id(payload, "signal_id")) is not None:
+                job_signals.setdefault(job_id, signal_id)
+        elif event.kind == "reviewer_decision" and job_id is not None:
+            decisions.setdefault(job_id, record)
+        if event.kind == "user_prompt":
+            client_id = _payload_id(payload, "client_user_message_id")
+            if client_id is not None:
+                prompts.setdefault(client_id, []).append(record)
+        control_id = _payload_id(payload, "control_id")
+        if control_id is None:
+            continue
+        if event.kind == "control_dispatch_started":
+            _append_control_observation(dispatch_observations, control_id, record)
+        elif event.kind == "control_rpc_accepted":
+            _append_control_observation(accepted_observations, control_id, record)
+        elif event.kind == "control_terminal":
+            _append_control_observation(terminal_observations, control_id, record)
+
+    ambiguous_ids = {
+        control_id
+        for control_id, observations in dispatch_observations.items()
+        if len(observations) > 1
+    }
+    dispatches = {
+        control_id: next(iter(observations.values()))
+        for control_id, observations in dispatch_observations.items()
+    }
+    accepted = {
+        control_id: next(iter(observations.values()))
+        for control_id, observations in accepted_observations.items()
+    }
+    terminals = {
+        control_id: next(iter(observations.values()))
+        for control_id, observations in terminal_observations.items()
+    }
+
+    dispatch_endpoints = {
+        control_id: accepted.get(control_id) or terminals[control_id]
+        for control_id in dispatches
+        if control_id not in ambiguous_ids and (control_id in accepted or control_id in terminals)
+    }
+    dispatch_ms = tuple(
+        duration
+        for control_id, terminal in dispatch_endpoints.items()
+        if (duration := _monotonic_elapsed_ms(dispatches[control_id], terminal)) is not None
+    )
+    adoption_eligible = 0
+    adoptions = 0
+    adoption_ms: list[float] = []
+    detection_to_adoption_ms: list[float] = []
+    adoption_lead_ms: list[float] = []
+    adoption_lag_ms: list[float] = []
+    for control_id, control in accepted.items():
+        payload = control.event.payload
+        client_id = _payload_id(payload, "client_user_message_id")
+        if payload.get("control_kind") != "steer" or client_id is None:
+            continue
+        adoption_eligible += 1
+        dispatch = dispatches.get(control_id)
+        if dispatch is None or control_id in ambiguous_ids:
+            continue
+        turn_key = _review_turn_key(control)
+        prompt = next(
+            (
+                candidate
+                for candidate in prompts.get(client_id, ())
+                if turn_key is not None
+                and _review_turn_key(candidate) == turn_key
+                and _observed_after_dispatch(dispatch, candidate)
+            ),
+            None,
+        )
+        if prompt is None:
+            continue
+        adoptions += 1
+        if (duration := _monotonic_elapsed_ms(control, prompt)) is not None:
+            adoption_ms.append(duration)
+        job_id = _payload_id(payload, "review_job_id")
+        signal_id = job_signals.get(job_id) if job_id is not None else None
+        first = signal_evidence.get(signal_id) if signal_id is not None else None
+        if first is not None and (duration := _monotonic_elapsed_ms(first, prompt)) is not None:
+            detection_to_adoption_ms.append(duration)
+        boundary = turn_boundaries.get(turn_key) if turn_key is not None else None
+        delta = _monotonic_delta_ms(prompt, boundary) if boundary is not None else None
+        if delta is not None:
+            (adoption_lead_ms if delta >= 0 else adoption_lag_ms).append(abs(delta))
+
+    terminal_outcomes = {
+        control_id: terminal.event.payload.get("outcome")
+        for control_id, terminal in terminals.items()
+    }
+    stale_delivery_ms = tuple(
+        duration
+        for terminal in terminals.values()
+        if terminal.event.payload.get("outcome") == "stale"
+        and (job_id := _payload_id(terminal.event.payload, "review_job_id")) is not None
+        and (decision := decisions.get(job_id)) is not None
+        and (duration := _monotonic_elapsed_ms(decision, terminal)) is not None
+    )
+    return _ControlLifecycle(
+        dispatches=len(dispatches),
+        dispatch_finishes=len(dispatch_endpoints),
+        rpc_accepted=len(accepted),
+        failed=sum(outcome == "failed" for outcome in terminal_outcomes.values()),
+        unknown=sum(outcome == "unknown" for outcome in terminal_outcomes.values()),
+        stale=sum(outcome == "stale" for outcome in terminal_outcomes.values()),
+        ambiguous_ids=len(ambiguous_ids),
+        adoption_eligible=adoption_eligible,
+        adoptions=adoptions,
+        dispatch_ms=dispatch_ms,
+        adoption_ms=tuple(adoption_ms),
+        detection_to_adoption_ms=tuple(detection_to_adoption_ms),
+        adoption_lead_ms=tuple(adoption_lead_ms),
+        adoption_lag_ms=tuple(adoption_lag_ms),
+        stale_delivery_ms=stale_delivery_ms,
+    )
+
+
+def _append_control_observation(
+    target: dict[str, dict[str, StepRecord]], control_id: str, record: StepRecord
+) -> None:
+    observation_id = record.event.event_id or f"step:{record.step}"
+    target.setdefault(control_id, {}).setdefault(observation_id, record)
+
+
+def _observed_after_dispatch(dispatch: StepRecord, candidate: StepRecord) -> bool:
+    if candidate.step <= dispatch.step:
+        return False
+    monotonic_delta = _monotonic_delta_ms(dispatch, candidate)
+    return monotonic_delta is None or monotonic_delta >= 0
+
+
 def _covered_signal_count(
     signal_ids: set[str], counts: Mapping[str, int], *, first_is_not_repeated: bool = False
 ) -> CoveredCount:
@@ -639,7 +901,11 @@ def _review_turn_key(record: StepRecord) -> tuple[str, str, int] | None:
 
 
 def render_runtime_costs(report: RuntimeCostReport) -> str:
-    lines = ["Runtime cost / efficiency (coverage-aware):", "  Main semantic actions:"]
+    lines = [
+        "Runtime cost / efficiency (coverage-aware):",
+        "  Main semantic actions: global identity; "
+        f"cross_surface_overlap={report.cross_surface_action_overlaps}",
+    ]
     for surface, cost in report.surfaces.items():
         lines.append(
             f"    {surface}: actions={cost.actions} "
@@ -667,9 +933,6 @@ def render_runtime_costs(report: RuntimeCostReport) -> str:
         "source=durable token_usage provenance; turn coverage "
         f"{report.token_turns}/{report.completed_turns}; observations={report.token_observations}"
     )
-    reviewer_tokens = (
-        str(report.reviewer_tokens) if report.reviewer_tokens is not None else "unknown"
-    )
     queue = _sample(report.reviewer_queue_ms, report.reviewer_jobs_started)
     inference = _sample(report.reviewer_inference_ms, report.reviewer_inference_finishes)
     end_to_end = _sample(report.reviewer_end_to_end_ms, report.reviewer_jobs_decided)
@@ -677,7 +940,7 @@ def render_runtime_costs(report: RuntimeCostReport) -> str:
     decision_lag = _sample(report.reviewer_decision_lag_ms, report.reviewer_jobs_decided)
     lines.append(
         f"  Spotter semantic: reviewer_calls={report.reviewer_calls}, "
-        f"recorded_session_tokens={reviewer_tokens}; queue={queue}, "
+        f"recorded_session_tokens={_reviewer_token_coverage(report)}; queue={queue}, "
         f"inference={inference}"
     )
     lines.append(
@@ -689,6 +952,22 @@ def render_runtime_costs(report: RuntimeCostReport) -> str:
         f"decided={report.reviewer_jobs_decided} errors={report.reviewer_jobs_errored} "
         f"capped={report.reviewer_jobs_capped} discarded={report.reviewer_jobs_discarded} "
         f"stale={report.reviewer_jobs_stale}"
+    )
+    lines.append(
+        "  Runtime control: "
+        f"dispatches={report.control_dispatches} accepted={report.control_rpc_accepted} "
+        f"failed={report.control_failed} unknown={report.control_unknown} "
+        f"stale={report.control_stale} ambiguous_ids={report.control_ambiguous_ids}; "
+        f"dispatch={_sample(report.control_dispatch_ms, report.control_dispatch_finishes)}, "
+        f"adoption={_sample(report.control_adoption_ms, report.control_adoptions)} "
+        f"({report.control_adoptions}/"
+        f"{report.control_adoption_eligible} accepted steers observed), "
+        "detection_to_adoption="
+        f"{_sample(report.control_detection_to_adoption_ms, report.control_adoptions)}; "
+        "adoption_boundary "
+        f"lead={_sample(report.control_adoption_lead_ms, report.control_adoptions)}, "
+        f"lag={_sample(report.control_adoption_lag_ms, report.control_adoptions)}; "
+        f"stale_delivery={_sample(report.control_stale_delivery_ms, report.control_stale)}"
     )
     lines.append(
         "  Detected repetition: "
@@ -715,7 +994,7 @@ def render_runtime_costs(report: RuntimeCostReport) -> str:
         f"  Spotter resources: cpu={cpu}, peak_rss={rss}; "
         f"samples={report.daemon_resource_samples}/{report.gate_calls} gate calls"
     )
-    tool_outcomes = sum(cost.outcome_observations for cost in report.surfaces.values())
+    tool_outcomes = sum(cost.outcomes for cost in report.surfaces.values())
     lines.append(
         f"  Timing: receipt_wall={report.receipt_timestamps}/{report.events}, "
         f"source={report.source_timestamps}/{report.events}, "
@@ -731,8 +1010,25 @@ def render_runtime_costs(report: RuntimeCostReport) -> str:
     return "\n".join(lines)
 
 
-def measure_objective_outcomes(paths: Iterable[Path]) -> ObjectiveOutcomeReport:
-    """Join durable mechanical outcomes with costs carried by the same arm row."""
+def render_runtime_cost_summary(report: RuntimeCostReport) -> str:
+    """Render one coverage-aware line for per-session intervention review."""
+
+    main_tokens = _covered_tokens(report.main_token_breakdown.total, report.sessions)
+    return (
+        f"costs: main_tokens={main_tokens}; "
+        f"semantic reviewer_calls={report.reviewer_calls} "
+        f"reviewer_tokens={_reviewer_token_coverage(report)}; "
+        f"deterministic gate_calls={report.gate_calls}; "
+        f"control accepted={report.control_rpc_accepted} "
+        f"adoption={report.control_adoptions}/{report.control_adoption_eligible}; "
+        f"turn_wall={_sample(report.turn_wall_ms, report.completed_turns)}"
+    )
+
+
+def measure_objective_outcomes(
+    paths: Iterable[Path], *, session_id: str | None = None
+) -> ObjectiveOutcomeReport:
+    """Join durable mechanical outcomes and optionally select exact session provenance."""
 
     artifacts = 0
     arms: dict[str, _ObjectiveArm] = {}
@@ -741,6 +1037,8 @@ def measure_objective_outcomes(paths: Iterable[Path]) -> ObjectiveOutcomeReport:
         for row in _result_rows(path):
             arm = _objective_arm(row, path)
             if arm is None:
+                continue
+            if session_id is not None and not _objective_row_matches_session(row, path, session_id):
                 continue
             found = True
             previous = arms.get(arm.key)
@@ -804,8 +1102,14 @@ def measure_objective_outcomes(paths: Iterable[Path]) -> ObjectiveOutcomeReport:
     )
 
 
-def render_objective_outcomes(report: ObjectiveOutcomeReport) -> str:
-    lines = ["Objective experiment/scorer outcomes (separate from user sessions):"]
+def render_objective_outcomes(
+    report: ObjectiveOutcomeReport, *, session_id: str | None = None
+) -> str:
+    if session_id is None:
+        heading = "Objective experiment/scorer outcomes (separate from user sessions):"
+    else:
+        heading = f"Objective outcomes with durable provenance to session {session_id}:"
+    lines = [heading]
     if not report.arms:
         lines.append("  no versioned objective result rows found")
         return "\n".join(lines)
@@ -931,6 +1235,42 @@ def _objective_arm(row: Mapping[str, object], path: Path) -> _ObjectiveArm | Non
     )
 
 
+def _objective_row_matches_session(row: Mapping[str, object], path: Path, session_id: str) -> bool:
+    """Match only explicit arm or fork-prefix session provenance.
+
+    Task batches persist the Codex session captured from each arm. Replay
+    experiments persist both the forked arm session and a manifest pointing
+    back to the source prefix. File names and timestamps are intentionally not
+    used as fallback identity.
+    """
+
+    if any(row.get(field) == session_id for field in ("replay_source_session_id", "session_id")):
+        return True
+    manifest_value = row.get("fork_manifest")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        return False
+    manifest_path = Path(manifest_value)
+    if not manifest_path.is_absolute():
+        manifest_path = path.parent / manifest_path
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ObjectiveOutcomeError(
+            f"{path}: cannot read fork provenance {manifest_path}: {error}"
+        ) from error
+    if not isinstance(manifest, Mapping):
+        raise ObjectiveOutcomeError(f"{path}: fork provenance {manifest_path} is not an object")
+    prefix = manifest.get("prefix")
+    if not isinstance(prefix, Mapping):
+        raise ObjectiveOutcomeError(f"{path}: fork provenance {manifest_path} has no prefix")
+    manifest_session_id = prefix.get("source_session_id")
+    if not isinstance(manifest_session_id, str) or not manifest_session_id:
+        raise ObjectiveOutcomeError(
+            f"{path}: fork provenance {manifest_path} has no source session identity"
+        )
+    return manifest_session_id == session_id
+
+
 def _agent_reported_tokens(row: Mapping[str, object]) -> int | None:
     explicit = row.get("agent_reported_tokens")
     if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
@@ -961,16 +1301,13 @@ def _elapsed(started: object, ended: object) -> float | None:
     return duration * 1000 if duration >= 0 else None
 
 
-def _surface(records: tuple[StepRecord, ...]) -> str:
+def _event_surface(event: TraceEvent) -> str:
     return (
         "app_server"
-        if any(
-            record.event.connection_epoch is not None
-            or (
-                record.event.provenance is not None
-                and record.event.provenance.source == "codex_app_server"
-            )
-            for record in records
+        if event.connection_epoch is not None
+        or (
+            event.provenance is not None
+            and event.provenance.source in {"codex_app_server", "spotterd"}
         )
         else "hook"
     )
@@ -978,9 +1315,12 @@ def _surface(records: tuple[StepRecord, ...]) -> str:
 
 def _action_key(record: StepRecord) -> str | None:
     event = record.event
-    value = event.operation_id or event.payload.get("tool_use_id") or event.event_id
+    value = event.operation_id or event.payload.get("tool_use_id")
+    if isinstance(value, str) and value:
+        agent = event.identity.provenance.agent if event.identity is not None else "unknown-agent"
+        return f"{agent}:{value}"
     turn = _turn_id(record) or "unknown-turn"
-    return f"{turn}:{value}" if value is not None else None
+    return f"{turn}:{event.event_id}" if event.event_id is not None else None
 
 
 def _action_family(kind: str) -> str:
@@ -1004,10 +1344,6 @@ def _event_resources(payload: Mapping[str, object]) -> set[str]:
     if isinstance(server, str) and server and isinstance(tool, str) and tool:
         resources.add(f"tool:{server}/{tool}")
     return resources
-
-
-def _merge_counts(left: Mapping[str, int], right: Mapping[str, int]) -> dict[str, int]:
-    return dict(Counter(left) + Counter(right))
 
 
 def _render_families(cost: SurfaceCost) -> str:
@@ -1108,6 +1444,24 @@ def _observations(count: int) -> str:
 def _covered_tokens(metric: CoveredTokens, eligible: int) -> str:
     value = str(metric.value) if metric.value is not None else "unknown"
     return f"{value} ({metric.covered_sessions}/{eligible} sessions)"
+
+
+def _reviewer_token_coverage(report: RuntimeCostReport) -> str:
+    value = str(report.reviewer_tokens) if report.reviewer_tokens is not None else "unknown"
+    if report.reviewer_tokens is None:
+        status = "unavailable"
+    elif (
+        report.reviewer_token_sessions == report.reviewer_sessions
+        and report.reviewer_token_observations == report.reviewer_calls
+    ):
+        status = "exact"
+    else:
+        status = "partial"
+    return (
+        f"{value} ({report.reviewer_token_sessions}/{report.reviewer_sessions} "
+        f"reviewer sessions, {report.reviewer_token_observations}/{report.reviewer_calls} "
+        f"calls; {status})"
+    )
 
 
 def _covered_count(metric: CoveredCount) -> str:

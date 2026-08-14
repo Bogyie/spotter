@@ -338,6 +338,20 @@ class AppServerTraceIngestor:
         self._remember(record.event, route)
         return record
 
+    def append_operational(self, event: TraceEvent, *, observed_at: float) -> StepRecord:
+        """Persist pre-normalized telemetry without touching live ingestion indexes.
+
+        This entry point is safe to run in a worker thread. The event-loop owner
+        must call :meth:`index_operational` after the append completes.
+        """
+
+        return StepJournal(self.journals_dir / _route(event)).record(event, observed_at=observed_at)
+
+    def index_operational(self, record: StepRecord) -> None:
+        """Publish a completed worker-thread append to event-loop-owned indexes."""
+
+        self._remember(record.event, _route(record.event))
+
     def records(self) -> tuple[StepRecord, ...]:
         """Return durable App Server history for conservative daemon hydration."""
 
@@ -403,7 +417,10 @@ class AppServerTraceIngestor:
 def _normalize_item(item: Mapping[str, Any], completed: bool) -> tuple[str, dict[str, Any]]:
     item_type = _optional_string(item.get("type")) or "unknown"
     if item_type == "userMessage":
-        return "user_prompt", {"content": _user_content(item.get("content"))}
+        payload: dict[str, Any] = {"content": _user_content(item.get("content"))}
+        if (client_id := _optional_string(item.get("clientId"))) is not None:
+            payload["client_user_message_id"] = client_id
+        return "user_prompt", payload
     if item_type == "agentMessage":
         return "agent_message", _known(item, "text", "phase")
     if item_type == "plan":
