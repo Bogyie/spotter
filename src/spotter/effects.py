@@ -283,7 +283,10 @@ def _configured_mcp_resource(
 def effect_event(result: TraceEvent) -> TraceEvent | None:
     """Turn a completed Class C call into a durable, compact ledger entry."""
 
-    if result.kind != "tool_result" or result.payload.get("reversibility_class") != "C":
+    if (
+        result.kind not in {"tool_result", "command_result", "file_edit"}
+        or result.payload.get("reversibility_class") != "C"
+    ):
         return None
     outcome, evidence = _effect_outcome(result.payload)
     effect_id, correlation_quality = _effect_identity(result)
@@ -375,14 +378,23 @@ def _has_explicit_success(payload: Mapping[str, object], response: object) -> bo
     candidates: list[object] = [payload.get("success"), payload.get("status")]
     if isinstance(response, Mapping):
         candidates.extend((response.get("ok"), response.get("success"), response.get("status")))
+    has_exit_code = _has_exit_code(payload, response)
     return any(
         value is True
         or (
             isinstance(value, str)
             and value.casefold() in {"completed", "passed", "succeeded", "success"}
+            and not (has_exit_code and value.casefold() == "completed")
         )
         for value in candidates
     )
+
+
+def _has_exit_code(payload: Mapping[str, object], response: object) -> bool:
+    values = [payload.get("exitCode"), payload.get("exit_code")]
+    if isinstance(response, Mapping):
+        values.append(response.get("exit_code"))
+    return any(isinstance(value, int) and not isinstance(value, bool) for value in values)
 
 
 def _has_zero_exit_code(payload: Mapping[str, object], response: object) -> bool:
