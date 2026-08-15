@@ -193,9 +193,20 @@ codex
 
 ## 6. Configuration
 
-Configuration is optional. By default, Spotter looks for `~/.spotter/spotter.toml`; setting
-`SPOTTER_HOME` moves the Spotter configuration, data, integration, runtime, and log root together.
-You can also select a file explicitly with `--config` during setup and diagnostics.
+Configuration is optional. Spotter resolves one effective snapshot in this order (later layers win):
+
+```text
+built-in defaults < ~/.spotter/spotter.toml < <repository>/spotter.toml < invocation overrides
+```
+
+Setting `SPOTTER_HOME` moves the global configuration, data, integration, runtime, and log root
+together. Repository configuration is discovered from the Git worktree root. You can select an
+additional highest-precedence file explicitly with `--config` during setup and diagnostics.
+Nested tables merge by key, while scalar values and lists replace lower-precedence values.
+Repository files are not operator-trusted policy: they cannot override `observation_only` or
+`mcp_semantics`, may only add `gates.forbidden_paths`, and may only enable (not disable)
+`gates.block_dependency_changes`. Ignored or invalid repository policy is reported and the valid
+operator configuration remains active.
 
 A conservative starting configuration is:
 
